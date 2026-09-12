@@ -2,6 +2,18 @@
 
 DeepSeek Harness 插件：把 ZCode 侧那套「协作模式」搬到 DSH 上。
 
+> ### 🤖 给要改这个插件的 AI
+>
+> **动手前先读仓库根的 [`AGENTS.md`](../AGENTS.md)** —— 改哪个文件、哪些是生成物、
+> 跑哪三条验证、九个实测坑，全在里面。
+>
+> 三条最容易踩的：
+> 1. **规则内容不在本目录**：五角色提示词与协作纪律的源在**上一级** `../content/`。
+>    本目录的 `content/` 是 `build.mjs` 拷贝出来的构建产物，已 gitignore——改它没用。
+> 2. **改完必须重启 `dsh web`**：模块代码不能热更新（实测三种热加载手段全失败）。
+> 3. **验证三件套**：`node build.mjs` → `node scripts/check-drift.mjs`（49/49）→
+>    `node tests/verify-plugin.mjs`（72/72）。首次跑夹具前先 `npm install`。
+
 它注册五类东西：
 
 | # | 内容 | 实现落点 |

@@ -11,9 +11,29 @@ license: MIT
 1. **部署**：按 references/ 里的材料，把协作模式装到本机（AI 全程代办，用户几乎零操作）。
 2. **运行时查询**：部署后日常使用中，用户问"该怎么搭配/怎么用/出问题了怎么办"，按本文件作答。
 
+## 用途三：改这套协作模式本身（给 AI 的入口）
+
+**当用户要求修改协作规则、角色提示词、钩子行为，或问"这套东西怎么维护"时**：
+
+本 Skill 是**生成物**——`references/agent-*.md` 由仓库根 `content/roles/*.md` 生成。
+**不要直接改本机 skill 目录里的文件**，那样改动不会进仓库、别人拿不到、下次生成还会被覆盖。
+
+正确入口：
+
+| 要改什么 | 改哪里 | 然后 |
+|---|---|---|
+| 协作纪律 / 角色提示词 | 仓库根 `content/`（`collab-rules.md`、`roles/*.md`） | 跑 `build.mjs` + `sync_from_manifest.py` |
+| 角色清单 / 工具权限 | 仓库根 `content/manifest.json` | 同上 |
+| 部署流程 / 双钢人决策（本文件） | `zcode-collab/SKILL.md` | 直接改，重跑部署 |
+| 四个钩子 | `zcode-collab/hooks/*.ps1` | 复制到 `~/.zcode/cli/hooks/` |
+
+**仓库**：https://github.com/Amer-CN/collab-mode
+**维护说明**：仓库根的 [`AGENTS.md`](https://github.com/Amer-CN/collab-mode/blob/main/AGENTS.md)
+——改哪个目录、哪些是生成物、跑哪三条验证、九个实测坑，全在里面。**动手前先读它。**
+
 ## 版本
 
-读取本 Skill 目录下的 `VERSION` 文件即为当前版本。用户问版本号、或要求检查更新时，报告 VERSION 内容即可（没有联网检查机制——更新由作者在群内发布新版 Skill，用户替换本目录即完成升级）。
+读取本 Skill 目录下的 `VERSION` 文件即为当前版本。用户问版本号、或要求检查更新时，报告 VERSION 内容即可（`scripts/version_check.py` 会联网比对远端 VERSION，输出 `behind` 时提示用户更新）。
 
 ## 用途一：部署（AI 自助安装，用户零界面操作）
 
