@@ -68,11 +68,27 @@ cd ..
 cd dsh-collab-mode
 node tests/verify-plugin.mjs
 cd ..
+
+# 5. 同步到本机 ZCode 生效（否则改了源，ZCode 里跑的还是旧提示词）
+cd zcode-collab
+python scripts/sync-agents.py ..          # 先预览
+python scripts/sync-agents.py .. --write  # 只换正文，frontmatter（model/color）一字不动
+cd ..
+# 然后重启 ZCode 或新开会话——子智能体在会话启动时发现
 ```
+
+⚠️ **第 5 步不能省**。`~/.zcode/agents/*.md` 是**部署产物**：仓库源改了它不会自动更新。
+2026-09-13 实测发现五个角色 + advisor 三席**全部落后于源**，v0.3.0 回补的 10 条规则
+从未在 ZCode 里生效——就是当时只同步了仓库、漏了这一步。
 
 ⚠️ **生成器传仓库根**（`..`，即含 `content/` 的目录）。若误传插件目录，脚本会打印
 `[提示] 传入的是插件目录…已自动改用仓库根` 并纠正——但**顺序不能反**：必须先 `build.mjs`
 再跑生成器，否则读到的是插件目录里的旧拷贝（防呆只纠路径，不会替你重新构建）。
+
+### 改了插件代码时（额外一步）
+
+DSH 的 `link:` 指向 `dsh-collab-mode`，它加载磁盘文件；但**模块代码不能热更新**
+（实测三种热加载手段全失败），所以改 `lib/` 后必须**重启 `dsh web`**。
 
 ### 改角色清单（增删角色、改工具权限）
 
@@ -209,6 +225,7 @@ git push origin main
 [ ] cd dsh-collab-mode && node build.mjs && node scripts/check-drift.mjs    49/49
 [ ] cd dsh-collab-mode && node tests/verify-plugin.mjs                      72/72
 [ ] cd zcode-collab && python scripts/sync_from_manifest.py ..              0 差异（或已 --write）
+[ ] cd zcode-collab && python scripts/sync-agents.py .. --write             同步到本机 agents（漏了则 ZCode 不生效）
 [ ] 改了 lib/ → 重启 dsh web → 设置→插件→插件配置 里「协作模式」可编辑 + 面板改路由后生效
 [ ] 改了 hooks/ → 复制到 ~/.zcode/cli/hooks/（本机用户才需要）
 [ ] 内容变更 → content/manifest.json 的 version 已升（VERSION 由生成器跟涨）

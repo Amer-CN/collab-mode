@@ -22,14 +22,19 @@ license: MIT
 
 | 要改什么 | 改哪里 | 然后 |
 |---|---|---|
-| 协作纪律 / 角色提示词 | 仓库根 `content/`（`collab-rules.md`、`roles/*.md`） | 跑 `build.mjs` + `sync_from_manifest.py` |
+| 协作纪律 / 角色提示词 | 仓库根 `content/`（`collab-rules.md`、`roles/*.md`） | 跑 `build.mjs` + `sync_from_manifest.py` + **`sync-agents.py`** |
 | 角色清单 / 工具权限 | 仓库根 `content/manifest.json` | 同上 |
 | 部署流程 / 双钢人决策（本文件） | `zcode-collab/SKILL.md` | 直接改，重跑部署 |
 | 四个钩子 | `zcode-collab/hooks/*.ps1` | 复制到 `~/.zcode/cli/hooks/` |
 
+⚠️ **改了角色提示词后，`~/.zcode/agents/*.md` 不会自动更新**——那些是部署产物。
+必须跑 `python scripts/sync-agents.py .. --write` 把新正文推过去（它只换正文，
+保留各文件的 `model:` / `color:`），然后**重启 ZCode 或新开会话**才生效。
+2026-09-13 实测：漏了这步导致五个角色全部落后于源，回补的规则从未生效。
+
 **仓库**：https://github.com/Amer-CN/collab-mode
 **维护说明**：仓库根的 [`AGENTS.md`](https://github.com/Amer-CN/collab-mode/blob/main/AGENTS.md)
-——改哪个目录、哪些是生成物、跑哪三条验证、九个实测坑，全在里面。**动手前先读它。**
+——改哪个目录、哪些是生成物、跑哪几条验证、九个实测坑，全在里面。**动手前先读它。**
 
 ## 版本
 
