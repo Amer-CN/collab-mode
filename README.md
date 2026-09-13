@@ -65,11 +65,16 @@ AI 一定知道自己跑在什么环境里，所以不会选错。
 
 ## 🟦 DeepSeek Harness 侧：装插件
 
-### 装法
+### 装法（克隆 + link，两步）
 
 ```powershell
-dsh plugin --profile web add https://github.com/Amer-CN/collab-mode
+git clone https://github.com/Amer-CN/collab-mode.git
+dsh plugin --profile web add link:<克隆到的父目录>/collab-mode/dsh-collab-mode
 ```
+
+⚠ 别用 `dsh plugin --profile web add https://github.com/Amer-CN/collab-mode` 一条命令直装——
+实测（pnpm 12.3.4）那会把整个仓库塞进 node_modules 当成一个无入口伪包（name/main 全空），
+插件在子目录里，DSH 根本加载不到。更新方式：在克隆目录 `git pull` 后重启 `dsh web`。
 
 本地开发时用 link 安装：`dsh plugin --profile web add link:F:/AIXM/collab-mode/dsh-collab-mode`
 

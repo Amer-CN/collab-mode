@@ -28,11 +28,15 @@ DeepSeek Harness 插件：把 ZCode 侧那套「协作模式」搬到 DSH 上。
 
 ## 安装
 
+GitHub 分发（2026-09-13 决策：**不发布 npm**），克隆仓库后 `link:` 安装：
+
 ```powershell
-dsh plugin --profile web add link:F:/AIXM/collab-mode/dsh-collab-mode
-# 发布到 npm 之后：
-# dsh plugin --profile web add dsh-collab-mode
+git clone https://github.com/Amer-CN/collab-mode.git
+dsh plugin --profile web add link:<克隆到的父目录>/collab-mode/dsh-collab-mode
 ```
+
+- 仓库根没有 package.json，pnpm 12 实测不支持从子目录安装（`#path=` 解析报错；git URL 整仓直装会装成无入口伪包），所以是克隆 + `link:` 两步。npm 包名安装（`dsh plugin --profile web add dsh-collab-mode`）仅当未来改变决策、正式发包后才可用。
+- 本地开发（作者机器）：`dsh plugin --profile web add link:F:/AIXM/collab-mode/dsh-collab-mode`
 
 `dsh plugin` 转发给 pnpm 之后会把包名补进 profile 的 `dsh.profile.bundles`。**重启 `dsh web` 生效**（bundle 层在进程启动时合成；已挂载的旧进程看不到新 bundle）。
 
