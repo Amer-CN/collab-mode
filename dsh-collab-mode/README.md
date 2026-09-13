@@ -144,7 +144,7 @@ A/B 能走原生 scope，但「工具到底注册没有 / 实际生效什么路�
 
 ## 2. 协作纪律系统提示段
 
-正文单一来源：`content/collab-rules.md`，构建时内联成 `lib/generated-content.js` 的 `RULES_TEXT`，由插件注册为一个系统提示段（默认名 `collab-mode:rules`，排序位 400 —— 在 persona 之后、PLAN_POLICY 之前）。
+正文单一来源：`content/collab-rules.md`，构建时内联成 `lib/generated-content.js` 的 `RULES_TEXT`，由插件注册为一个系统提示段（默认名 `collab-mode:rules`，排序位 400 —— 在 persona 之后、PLAN_POLICY 之前）。用户全局 `~/.dsh/AGENTS.md` 自 2026-09-13 起只放指针与环境说明，**不存规则正文**——2026-09-10 遗留的手抄副本曾与规则段双源打架（圆桌指向 DSH 不存在的工具），已退役为指针；谁往里回填规则，谁就造出下一份漂移副本。
 
 段落保真的语义：范围铁律、A/B/C/D 模式判断、用户纠偏词、改动自检、走流程四步、汇报纪律、决策前置（双钢人）、子智能体选择规则。
 
