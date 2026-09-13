@@ -16,12 +16,23 @@
 **核心约定：改规则只改 `content/`，两边都是生成物。**
 
 ```
-content/collab-rules.md  ─┬─→ dsh-collab-mode/lib/generated-content.js   (build.mjs 生成)
-content/roles/*.md       ─┤
-content/manifest.json    ─┴─→ zcode-collab/references/agent-*.md        (sync_from_manifest.py 生成)
+                      content/collab-rules.md（带平台占位符）
+                            │
+              build.mjs ────┴──── sync_from_manifest.py
+              （平台=dsh）              （平台=zcode）
+                            │
+  ┌─→ dsh-collab-mode/lib/generated-content.js 的 RULES_TEXT
+  │
+  ├─→ zcode-collab/references/global-agents.md
+  │
+  └── 占位符取值来自 content/manifest.json 的 rules.placeholders
+
+content/roles/*.md    ─┬─→ generated-content.js 的 ROLES[].persona（build.mjs）
+                       └─→ zcode-collab/references/agent-*.md（sync_from_manifest.py）
+content/manifest.json ─── 角色清单 + 平台差异（工具名/只读性/ZCode frontmatter/占位符）
 ```
 
-**为什么必须这样**：v0.3.0 之前两边靠手工同步，结果插件丢了 10 条规则（"不要 git commit""有立场禁止和稀泥""说真话"等）——因为插件那份是手写搬运的，不是生成的。**任何"手工改生成物"的行为都会重演这个事故。**
+**为什么必须这样**：v0.3.0 之前两边靠手工同步，结果插件丢了 10 条规则（"不要 git commit""有立场禁止和稀泥""说真话"等）——因为插件那份是手写搬运的，不是生成的。v0.4.0 之前规则文本也是两份各自维护，结果 ZCode 侧的圆桌规则引用了不存在的角色名 `advisor`（实际叫 `advisor-A/B/C`），**圆桌调用不到任何东西**。**任何"手工改生成物"的行为都会重演这类事故。**
 
 ### 角色数为什么两边不一样（5 vs 7）
 
@@ -33,6 +44,10 @@ content/manifest.json    ─┴─→ zcode-collab/references/agent-*.md        
 
 **这是设计差异，不是缺陷**——不要给 DSH 加三席，也不要以为 ZCode 多了两个角色。
 manifest 里 advisor 条目的 `zcode.seatNote` / `dsh.seatNote` 有同样说明。
+
+**规则文本里凡提到顾问角色，一律用 `{{ADVISOR}}` / `{{ADVISOR_CALL}}` 占位符**，
+渲染时按平台换成 `advisor` 或 `advisor-A/B/C`——否则会出现"规则引用一个不存在的角色名"
+（v0.4.0 之前 ZCode 侧的圆桌规则就是这样，导致圆桌调用不到任何东西）。
 
 ---
 
@@ -53,7 +68,10 @@ cd ..
 没装依赖时夹具会明确提示（`夹具无法加载 lib/index.js：缺少依赖。先装再跑：npm install`），
 不会抛裸的 MODULE_NOT_FOUND。
 
-### 改协作纪律 / 角色提示词（四步）
+### 改协作纪律 / 角色提示词（六步）
+
+**改规则文本时**：`content/collab-rules.md` 里两侧措辞不同的地方用占位符
+（`{{ADVISOR}}` 等，见第 1 节"平台占位符"），不要只写一侧的角色名。
 
 ```powershell
 # 0. 站在仓库根（含 AGENTS.md 的目录）
@@ -66,7 +84,7 @@ cd ..
 # 2. 同步 DSH 侧（插件目录里的 content/ 是构建时拷贝的副本，这一步负责刷新它）
 cd dsh-collab-mode
 node build.mjs
-node scripts/check-drift.mjs      # 必须 49/49
+node scripts/check-drift.mjs      # 必须全绿
 cd ..
 
 # 3. 同步 ZCode 侧（生成 references/agent-*.md）
@@ -75,7 +93,7 @@ python scripts/sync_from_manifest.py ..          # 先预览：传仓库根
 python scripts/sync_from_manifest.py .. --write  # 确认无误再写
 cd ..
 
-# 4. 跑夹具（72 项）
+# 4. 跑夹具（全绿）
 cd dsh-collab-mode
 node tests/verify-plugin.mjs
 cd ..
@@ -86,6 +104,10 @@ python scripts/sync-agents.py ..          # 先预览
 python scripts/sync-agents.py .. --write  # 只换正文，frontmatter（model/color）一字不动
 cd ..
 # 然后重启 ZCode 或新开会话——子智能体在会话启动时发现
+
+# 6. 改了规则文本时，同步本机全局规则文件（同样不会自动生效）
+#    把 zcode-collab/references/global-agents.md 的全文替换进 ~/.zcode/AGENTS.md 的规则段，
+#    保留文件末尾的「维护入口」节，然后重启 ZCode。
 ```
 
 ⚠️ **第 5 步不能省**。`~/.zcode/agents/*.md` 是**部署产物**：仓库源改了它不会自动更新。
@@ -108,7 +130,24 @@ DSH 的 `link:` 指向 `dsh-collab-mode`，它加载磁盘文件；但**模块�
 - `roles[].zcode.description` / `.color` / `.tools` / `.injectAgentsMd` — ZCode 侧用
 - `roles[].zcode.toolsNote` / `.nameNote` — frontmatter 里的注释（条件信息，别丢）
 
-改完跑第 1 节的四步。`check-drift.mjs` 会校验**四处角色数相等**（manifest / content/roles/*.md / 生成物 ROLES / 面板 ROLE_ROWS），少一处就报错。
+改完跑第 1 节的步骤。`check-drift.mjs` 会校验**四处角色数相等**（manifest / content/roles/*.md / 生成物 ROLES / 面板 ROLE_ROWS），少一处就报错。
+
+### 平台占位符（v0.4.0，规则文本的两侧差异怎么表达）
+
+`content/collab-rules.md` 是**一份源渲染两个平台**。两边措辞不同时不用改代码，用两种占位符：
+
+1. **行内替换** `{{NAME}}` —— 取值放 `content/manifest.json` 的 `rules.placeholders`：
+   ```json
+   "placeholders": {
+     "ADVISOR": { "dsh": "`advisor`", "zcode": "`advisor-A` / `advisor-B` / `advisor-C`" }
+   }
+   ```
+2. **平台块** `{{#zcode}}…{{/zcode}}` —— 只有该平台才保留的内容（如引用 `decision-full.md`，
+   那是 ZCode 独有的文件）；另一平台渲染时整块删除。
+
+**铁律**：占位符的**取值**只放 manifest，渲染代码里不写死任何角色名或文案；
+新增占位符必须 dsh、zcode 两侧都有取值（缺一 check-drift 会 FAIL）；
+源里的平台块标记必须成对。改完照第 1 节流程跑，`check-drift` 会校验全部约定。
 
 ---
 
@@ -126,8 +165,8 @@ DSH 的 `link:` 指向 `dsh-collab-mode`，它加载磁盘文件；但**模块�
 ```powershell
 cd dsh-collab-mode                  # 从仓库根出发
 node build.mjs                    # 生成物
-node scripts/check-drift.mjs      # 49 项：内容一致性
-node tests/verify-plugin.mjs      # 72 项：行为（钩子/工具/面板/安全栅栏）
+node scripts/check-drift.mjs      # 全绿：内容一致性
+node tests/verify-plugin.mjs      # 全绿：行为（钩子/工具/面板/安全栅栏）
 ```
 
 ### 活体验证（改客户端或面板必做）
@@ -147,11 +186,12 @@ node tests/verify-plugin.mjs      # 72 项：行为（钩子/工具/面板/安�
 |---|---|---|
 | `zcode-collab/SKILL.md` | 部署 6 步 + 日常答疑 + 双钢人决策 | 直接改 |
 | `zcode-collab/hooks/*.ps1` | 四个 PowerShell 钩子 | 直接改；**改完要复制到 `~/.zcode/cli/hooks/`** |
-| `zcode-collab/references/agent-*.md` | **生成物**（由 `content/` 生成） | 手改会被下次生成覆盖 |
-| `zcode-collab/references/global-agents.md` | 全局协作规则（AGENTS.md 正文） | 直接改 |
-| `zcode-collab/references/decision-full.md` | 双钢人完整版 12 段模板 | 直接改 |
+| `zcode-collab/references/agent-*.md` | **生成物**（由 `content/roles/*.md` 生成） | 手改会被下次生成覆盖 |
+| `zcode-collab/references/global-agents.md` | **生成物**（由 `content/collab-rules.md` 按 `zcode` 平台渲染） | 要改规则去改 `content/collab-rules.md`，手改此文件会被覆盖 |
+| `zcode-collab/references/decision-full.md` | 双钢人完整版 12 段模板（**ZCode 独有**，故不是生成物） | 直接改 |
 | `zcode-collab/scripts/version_check.py` | 版本自检 | 改仓库地址时**必须**同步 `REPO_URL` 与 `RAW_URL` |
-| `zcode-collab/scripts/sync_from_manifest.py` | 生成器 | 见第 1 节 |
+| `zcode-collab/scripts/sync_from_manifest.py` | 生成器（产出 `agent-*.md` + `global-agents.md` + `VERSION`） | 见第 1 节 |
+| `zcode-collab/scripts/sync-agents.py` | 把渲染好的 `agent-*.md` 推到本机 `~/.zcode/agents/` | 只换正文，保留各文件 `model:`/`color:` |
 
 ⚠️ **`~/.zcode/` 是用户配置树，不是仓库**。改仓库里的钩子后，用户本机不生效——要在 README 或部署步骤里说明"重新复制到 `~/.zcode/cli/hooks/`"。
 
@@ -233,12 +273,14 @@ git push origin main
 
 ```
 [ ] cd dsh-collab-mode && npm install（首次） && cd ..
-[ ] cd dsh-collab-mode && node build.mjs && node scripts/check-drift.mjs    49/49
-[ ] cd dsh-collab-mode && node tests/verify-plugin.mjs                      72/72
+[ ] cd dsh-collab-mode && node build.mjs && node scripts/check-drift.mjs    全绿
+[ ] cd dsh-collab-mode && node tests/verify-plugin.mjs                      全绿
 [ ] cd zcode-collab && python scripts/sync_from_manifest.py ..              0 差异（或已 --write）
 [ ] cd zcode-collab && python scripts/sync-agents.py .. --write             同步到本机 agents（漏了则 ZCode 不生效）
 [ ] 改了 lib/ → 重启 dsh web → 设置→插件→插件配置 里「协作模式」可编辑 + 面板改路由后生效
 [ ] 改了 hooks/ → 复制到 ~/.zcode/cli/hooks/（本机用户才需要）
+[ ] 改了规则文本 → 更新本机 ~/.zcode/AGENTS.md 规则段（保留维护入口节）→ 重启 ZCode
+[ ] 改了 zcode-collab/（SKILL.md / scripts / references）→ 复制覆盖本机 ~/.zcode/skills/zcode-collab/ → 重启 ZCode
 [ ] 内容变更 → content/manifest.json 的 version 已升（VERSION 由生成器跟涨）
 [ ] git add -A && git commit && git push origin main
 ```
@@ -251,7 +293,8 @@ git push origin main
 2. **夹具通过 ≠ 真实可用**——v0.2.0 的 61 项断言全绿，但面板在真实浏览器里是空壳（`inject` 缺声明）。→ 所以活体验证不可省。
 3. **验证方法本身可能是错的**——曾用字符串匹配检测"规则漂移"，把"改写了措辞"全判成"丢失"（报 55 条，实际 10 条）；也曾因 JSON 转义误报 2 条规则缺失。→ 所以验证要先解析再判定，别直接 grep 转义内容。
 4. **统计方法要正确**——档位实测曾因内联的 p 值公式有 bug（恒返回 1.0000）差点得出错误结论。→ 统计脚本单独写、单独验。
-5. **改了源不等于生效**——`~/.zcode/agents/*.md` 是部署产物，2026-09-13 实测五个角色全部落后于源，v0.3.0 回补的 10 条规则从未在 ZCode 里跑过。→ 所以有第 5 步 `sync-agents.py`。
+5. **规则文本两份各自维护必出事**——v0.4.0 之前 `collab-rules.md`（DSH）与 `global-agents.md`（ZCode）各写各的，ZCode 侧圆桌规则引用了不存在的角色名 `advisor`，圆桌调用不到任何东西。→ 所以规则文本也进单一来源（平台占位符），check-drift 有回归断言。
+6. **改了源不等于生效**——`~/.zcode/agents/*.md` 是部署产物，2026-09-13 实测五个角色全部落后于源，v0.3.0 回补的 10 条规则从未在 ZCode 里跑过。→ 所以有第 5 步 `sync-agents.py`。
 
 ---
 

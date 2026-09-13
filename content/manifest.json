@@ -1,7 +1,29 @@
 {
-  "version": "1.2.0",
+  "version": "1.3.0",
   "rules": {
-    "file": "collab-rules.md"
+    "file": "collab-rules.md",
+    "placeholders": {
+      "ADVISOR": {
+        "dsh": "`advisor`",
+        "zcode": "`advisor-A` / `advisor-B` / `advisor-C`"
+      },
+      "GENERIC": {
+        "dsh": "通用子智能体",
+        "zcode": "`general-purpose`"
+      },
+      "EXPLORE": {
+        "dsh": "只读探索类子智能体",
+        "zcode": "`Explore` 或 `general-purpose`"
+      },
+      "ADVISOR_CALL": {
+        "dsh": "分别调用 `advisor` 若干轮，并在设置面板为每轮换不同厂商的模型",
+        "zcode": "同时调用 `advisor-A`、`advisor-B` 和 `advisor-C` 各出一轮意见；三席必须配置为不同厂商的模型，否则圆桌变复读"
+      },
+      "STEELMAN_TAIL": {
+        "dsh": "。",
+        "zcode": "；prompt 存于 `~/.zcode/snippets/two-way-steelman.md`，触发时先读该文件。"
+      }
+    }
   },
   "roles": [
     {

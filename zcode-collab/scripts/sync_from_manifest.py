@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
-"""sync_from_manifest.py — 从插件仓库 content/ + manifest.json 生成 skill 的 agent-*.md
+"""sync_from_manifest.py — 从插件仓库 content/ + manifest.json 生成 skill 的产物
 
 单一来源约定（v0.3.0 起）：
-- 正文唯一来源 = 插件仓库 content/roles/*.md
+- 角色正文唯一来源 = 插件仓库 content/roles/*.md
 - frontmatter 锚点 = skill 现有文件的 frontmatter（只字不动），除 tools 列表外
   tools 列表来自 manifest 的 zcode.tools（如 research 的 GitHub MCP 工具增减）
 - model: 占位符、name、color 等部署元信息一律保留 skill 现有值
+
+单一来源约定（v0.4.0 起）：
+- 规则文本唯一来源 = 插件仓库 content/collab-rules.md（带平台占位符）
+- 按 zcode 平台渲染后写入 references/global-agents.md
 
 用法（以 skill 目录为 cwd）：
     python scripts/sync_from_manifest.py <插件仓库根> [--write]
 
 不带 --write 时只做 diff 预览并 exit 1（有差异）/ 0（一致）；
-带 --write 时回写 references/agent-*.md。VERSION 对齐由本脚本一并完成
-（manifest.version → skill VERSION）。
+带 --write 时回写 references/agent-*.md、references/global-agents.md。
+VERSION 对齐由本脚本一并完成（manifest.version → skill VERSION）。
 
 设计铁律：
 - 永不丢规则：正文整段替换，不做行级合并
 - 永不改 frontmatter 部署信息：只允许刷新 tools 列表
 - researcher 的 toolsNote 注释行必须保留（那是部署条件的活文档）
 - advisor 一份模板生成三席文件（advisor-A/B/C，仅 name 不同）
+- 规则文本的占位符语义必须与 dsh-collab-mode/build.mjs 的 renderRules() 逐字一致
 """
 import json
 import re
@@ -26,6 +31,8 @@ import sys
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
+
+RULES_OUT = "global-agents.md"
 
 # 角色 key → skill 文件名（advisor 一份模板出三席）
 ROLE_FILES = {
@@ -41,6 +48,71 @@ ADVISOR_SEATS = {
     "advisor-b.md": "advisor-B",
     "advisor-c.md": "advisor-C",
 }
+
+# 平台块标记：`{{#zcode}}` / `{{/zcode}}`，各占一整行（行内无其他内容）。
+_BLOCK_OPEN = re.compile(r"^\{\{#([A-Za-z0-9_-]+)\}\}$")
+_BLOCK_CLOSE = re.compile(r"^\{\{/([A-Za-z0-9_-]+)\}\}$")
+# 行内占位符：`{{NAME}}`
+_INLINE = re.compile(r"\{\{([A-Za-z0-9_-]+)\}\}")
+
+
+def render_rules(text: str, platform: str, placeholders: dict) -> str:
+    """按平台渲染 collab-rules.md。
+
+    占位符语法约定（与 dsh-collab-mode/build.mjs 的 renderRules() 语义一致）：
+
+      `{{NAME}}`            行内替换：取 placeholders[NAME][platform]，
+                            取值一律来自 manifest，本文件不写死任何角色名或文案。
+      `{{#platform}}` 块    平台块：起始行与结束行各占一整行。
+                            当前平台命中 → 去掉两行标记、保留块内内容；
+                            未命中 → 整块删除，并连同块前的一个空行一起删掉
+                            （源里用「空行 + 块」表示该块独占一段）。
+
+    渲染后若仍残留 `{{` 一律抛错（占位符名拼错、块未闭合都会在这里暴露）。
+    """
+    out: list[str] = []
+    skipping: str | None = None
+    for line in text.split("\n"):
+        m = _BLOCK_OPEN.match(line)
+        if m and skipping is None:
+            if m.group(1) == platform:
+                continue
+            skipping = m.group(1)
+            if out and out[-1].strip() == "":
+                out.pop()
+            continue
+        m = _BLOCK_CLOSE.match(line)
+        if m:
+            if skipping is not None:
+                if m.group(1) != skipping:
+                    raise ValueError(
+                        f"平台块 {{{{#{skipping}}}}} 被 {{{{/{m.group(1)}}}}} 关闭，标签不匹配"
+                    )
+                skipping = None
+                continue
+            if m.group(1) == platform:
+                continue
+            raise ValueError(
+                f"出现孤立的平台块结束标记 {{{{/{m.group(1)}}}}}（没有对应的 {{{{#{m.group(1)}}}}}）"
+            )
+        if skipping is not None:
+            continue
+        out.append(line)
+    if skipping is not None:
+        raise ValueError(f"平台块 {{{{#{skipping}}}}} 没有闭合的 {{{{/{skipping}}}}}")
+
+    def sub(match: re.Match) -> str:
+        name = match.group(1)
+        value = (placeholders.get(name) or {}).get(platform)
+        if not isinstance(value, str) or value == "":
+            raise ValueError(f"占位符 {match.group(0)} 在 manifest.rules.placeholders 里没有 {platform} 取值")
+        return value
+
+    rendered = _INLINE.sub(sub, "\n".join(out))
+    left = re.search(r"\{\{[^}]*\}\}", rendered)
+    if left is not None:
+        raise ValueError(f"渲染 {platform} 规则文本后仍有占位符残留：{left.group(0)}")
+    return rendered
 
 
 def split_frontmatter(text: str) -> tuple[str, str]:
@@ -175,6 +247,32 @@ def main() -> int:
                 print(f"[差异] {fname}")
         else:
             print(f"[一致] {fname}")
+
+    # 产物二：规则文本（v0.4.0 起单一来源，按 zcode 平台渲染）
+    rules_file = manifest["rules"]["file"]
+    rules_src = content_root / "content" / rules_file
+    # 源文本规范化与 build.mjs 的 readContent() 一致：统一 LF、去掉尾部空白、末尾恰好一个换行
+    raw = rules_src.read_text(encoding="utf-8").replace("\r\n", "\n").rstrip()
+    rendered = render_rules(
+        raw,
+        "zcode",
+        manifest["rules"].get("placeholders", {}),
+    ).rstrip("\n") + "\n"
+    rules_path = SKILL_DIR / "references" / RULES_OUT
+    if not rules_path.exists():
+        print(f"[新增] {RULES_OUT}")
+        changed.append(RULES_OUT)
+        if write:
+            rules_path.write_text(rendered, encoding="utf-8", newline="\n")
+    elif rules_path.read_text(encoding="utf-8") != rendered:
+        changed.append(RULES_OUT)
+        if write:
+            rules_path.write_text(rendered, encoding="utf-8", newline="\n")
+            print(f"[更新] {RULES_OUT}")
+        else:
+            print(f"[差异] {RULES_OUT}")
+    else:
+        print(f"[一致] {RULES_OUT}")
 
     # VERSION 对齐
     vfile = SKILL_DIR / "VERSION"

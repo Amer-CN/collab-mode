@@ -6,10 +6,11 @@ license: MIT
 
 # ZCode 多模型协作模式（zcode-collab）
 
-把"顶级模型编排 → 便宜模型执行 → 跨厂商独立审查"落成 ZCode 配置。本 Skill 有两个用途：
+把"顶级模型编排 → 便宜模型执行 → 跨厂商独立审查"落成 ZCode 配置。本 Skill 有三个用途：
 
 1. **部署**：按 references/ 里的材料，把协作模式装到本机（AI 全程代办，用户几乎零操作）。
 2. **运行时查询**：部署后日常使用中，用户问"该怎么搭配/怎么用/出问题了怎么办"，按本文件作答。
+3. **维护**：修改这套协作模式本身时，入口见下「用途三」。
 
 ## 用途三：改这套协作模式本身（给 AI 的入口）
 
@@ -39,7 +40,7 @@ advisor 一份源在 ZCode 侧拆成 **advisor-A / advisor-B / advisor-C 三席*
 
 **仓库**：https://github.com/Amer-CN/collab-mode
 **维护说明**：仓库根的 [`AGENTS.md`](https://github.com/Amer-CN/collab-mode/blob/main/AGENTS.md)
-——改哪个目录、哪些是生成物、跑哪几条验证、九个实测坑，全在里面。**动手前先读它。**
+——改哪个目录、哪些是生成物、跑哪几条验证、实测踩过的坑，全在里面。**动手前先读它。**
 
 ## 版本
 

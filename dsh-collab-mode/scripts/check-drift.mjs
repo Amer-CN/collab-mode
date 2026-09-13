@@ -5,7 +5,8 @@
  * 为什么需要它：v0.3.0 之前，角色清单在 `build.mjs`、正文在 `content/roles/*.md`、
  * ZCode skill 侧另有一份手写搬运的副本 —— 手工同步两份文本，丢了规则也没人发现。
  * 本脚本把「三处角色数必须相等」「manifest 声明的文件必须存在且非空」
- * 「生成物不得被手工编辑」变成可执行的断言。
+ * 「生成物不得被手工编辑」「规则文本占位符取值齐全、两侧产物无残留」
+ * 变成可执行的断言。
  *
  * 运行：node scripts/check-drift.mjs      （退出码非 0 表示有漂移）
  */
@@ -147,6 +148,102 @@ for (const role of manifest.roles) {
   check(`roles[${role.key}].zcode.color 非空`, typeof z?.color === 'string' && z.color !== '')
   check(`roles[${role.key}].zcode.tools 是非空数组`, Array.isArray(z?.tools) && z.tools.length > 0, String(z?.tools?.length))
   check(`roles[${role.key}].zcode.injectAgentsMd 是布尔`, typeof z?.injectAgentsMd === 'boolean', String(z?.injectAgentsMd))
+}
+
+/* ---- 7. 规则文本单一来源：占位符取值齐全 + 两侧产物无残留 + 圆桌条目渲染出真名 ----
+ *
+ * 背景：v0.4.0 起 `content/collab-rules.md` 是两侧规则文本的唯一来源，用
+ * `{{NAME}}` 行内占位符和 `{{#平台}}…{{/平台}}` 平台块表达差异。
+ * 渲染器有两份实现，语义必须一致：
+ *   DSH  侧 dsh-collab-mode/build.mjs 的 renderRules()，平台取 `dsh`
+ *   ZCode 侧 zcode-collab/scripts/sync_from_manifest.py 的 render_rules()，平台取 `zcode`
+ * 本段断言三件事：源里的占位符都有两个平台的取值、两份产物都不残留 `{{`、
+ * 圆桌条目在两侧都渲染出**真实存在**的角色名（v0.4.0 之前 DSH 那份写的
+ * `advisor` 在 ZCode 侧不存在，圆桌调用不到任何东西）。 */
+
+console.log('\n[6] 规则文本单一来源（占位符 + 两侧渲染产物）')
+
+const placeholders = manifest.rules?.placeholders ?? {}
+const rulesSource = readFileSync(join(root, 'content', manifest.rules.file), 'utf8')
+
+// 7.1 源里的每个 `{{NAME}}` 都能在 manifest 找到 dsh + zcode 两个取值
+const inlineNames = new Set()
+for (const m of rulesSource.matchAll(/\{\{(?![#/])([A-Za-z0-9_-]+)\}\}/g)) inlineNames.add(m[1])
+check('源里至少声明了一个行内占位符', inlineNames.size > 0, String(inlineNames.size))
+for (const name of [...inlineNames].sort()) {
+  const entry = placeholders[name]
+  check(`占位符 {{${name}}} 有 dsh 取值`, typeof entry?.dsh === 'string' && entry.dsh !== '', JSON.stringify(entry?.dsh))
+  check(`占位符 {{${name}}} 有 zcode 取值`, typeof entry?.zcode === 'string' && entry.zcode !== '', JSON.stringify(entry?.zcode))
+}
+// 平台块标记必须成对，且块名是 manifest 里真有取值的平台（否则渲染器会静默漏掉一段）
+const openBlocks = [...rulesSource.matchAll(/^\{\{#([A-Za-z0-9_-]+)\}\}$/gm)].map((m) => m[1])
+const closeBlocks = [...rulesSource.matchAll(/^\{\{\/([A-Za-z0-9_-]+)\}\}$/gm)].map((m) => m[1])
+check('源里平台块开闭标记数量相等', openBlocks.length === closeBlocks.length, `开 ${openBlocks.length} vs 闭 ${closeBlocks.length}`)
+for (const block of new Set(openBlocks)) {
+  check(`平台块 {{#${block}}} 是 manifest 里有取值的平台`, Object.values(placeholders).some((v) => typeof v?.[block] === 'string'), block)
+}
+
+// 7.2 两份渲染产物均无 `{{` 残留
+const freshGenerated = await import(`${new URL('../lib/generated-content.js', import.meta.url).href}?drift=${Date.now()}`)
+const dshRules = freshGenerated.RULES_TEXT
+check('DSH 产物 RULES_TEXT 无 {{ 残留', !dshRules.includes('{{'), dshRules.match(/\{\{[^}]*\}\}/)?.[0])
+
+const zcodeRulesPath = join(root, '..', 'zcode-collab', 'references', 'global-agents.md')
+const zcodeRulesExists = existsSync(zcodeRulesPath)
+check('ZCode 产物 references/global-agents.md 存在', zcodeRulesExists, zcodeRulesPath)
+const zcodeRules = zcodeRulesExists ? readFileSync(zcodeRulesPath, 'utf8') : ''
+check('ZCode 产物无 {{ 残留', zcodeRulesExists && !zcodeRules.includes('{{'), zcodeRules.match(/\{\{[^}]*\}\}/)?.[0])
+
+// 7.2b ZCode 专属语义内容回归（v0.4.0 合并时曾丢掉这两处，主智能体拿
+// ~/.zcode/AGENTS.md.bak-before-v040 逐行 diff 才发现）：
+//   - 「汇报纪律」段末的 PostToolUse 钩子说明（平台块）
+//   - 「个人抉择类」行尾指向 ~/.zcode/snippets/two-way-steelman.md 的指引（{{STEELMAN_TAIL}}）
+// 两侧必须各自只出现在自己那侧 —— DSH 那份渲染出这些 ZCode 路径就是串味。
+for (const [label, text, shouldHave] of [
+  ['ZCode', zcodeRules, true],
+  ['DSH', dshRules, false],
+]) {
+  for (const needle of ['two-way-steelman.md', 'PostToolUse']) {
+    const hit = text.includes(needle)
+    check(`${label} 产物${shouldHave ? '含' : '不含'} ${needle}`, zcodeRulesExists && hit === shouldHave, hit ? '命中' : '未命中')
+  }
+}
+
+// 7.3 圆桌条目在两侧都渲染出真实存在的角色名
+const roundTableLine = (text) => text.split('\n').find((line) => line.includes('用户想听多方意见'))
+const backticked = (line) => [...line.matchAll(/`([A-Za-z0-9_-]+)`/g)].map((m) => m[1])
+
+// DSH 侧的真实角色名 = manifest 里声明的 dsh.toolName
+const dshNames = new Set(manifest.roles.map((r) => r.dsh.toolName))
+// ZCode 侧的真实角色名 = references/agent-*.md 的 frontmatter name；advisor 模板在
+// 部署时拆成三席，席位名（advisor-A/B/C）由 sync_from_manifest.py 的 ADVISOR_SEATS
+// 声明 —— 按那份声明解析，不把席位名写死在断言里。
+const zcodeNames = new Set()
+if (zcodeRulesExists) {
+  const refDir = join(root, '..', 'zcode-collab', 'references')
+  for (const f of readdirSync(refDir).filter((f) => /^agent-.*\.md$/.test(f))) {
+    const nameLine = readFileSync(join(refDir, f), 'utf8').match(/^name:\s*"([^"]+)"/m)
+    if (nameLine !== null) zcodeNames.add(nameLine[1])
+  }
+  const seatsScript = join(root, '..', 'zcode-collab', 'scripts', 'sync_from_manifest.py')
+  if (existsSync(seatsScript)) {
+    for (const m of readFileSync(seatsScript, 'utf8').matchAll(/^\s*"[^"]+":\s*"(advisor-[A-Za-z0-9_-]+)",\s*$/gm)) {
+      zcodeNames.add(m[1])
+    }
+  }
+  check('ZCode 侧解析出 advisor 三席名', zcodeNames.has('advisor-A') && zcodeNames.has('advisor-B') && zcodeNames.has('advisor-C'), [...zcodeNames].join(','))
+}
+for (const [label, text, names] of [
+  ['DSH', dshRules, dshNames],
+  ['ZCode', zcodeRules, zcodeNames],
+]) {
+  const line = roundTableLine(text)
+  check(`${label} 产物能找到圆桌条目（含「用户想听多方意见」的行）`, line !== undefined)
+  const cited = line === undefined ? [] : backticked(line)
+  check(`${label} 圆桌条目引用了至少一个角色名`, cited.length > 0, String(cited.length))
+  for (const name of cited) {
+    check(`${label} 圆桌条目引用的 ${name} 是真实角色名`, names.has(name), `可选：${[...names].join(',')}`)
+  }
 }
 
 console.log(`\n结果：${passed} 项通过，${failures.length} 项失败`)

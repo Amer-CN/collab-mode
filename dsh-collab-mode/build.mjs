@@ -3,7 +3,7 @@
  * 构建脚本：把 `content/` 下的单一来源内容内联成两份产物。
  *
  *   content/manifest.json      -> 角色清单与平台差异（唯一事实源）
- *   content/collab-rules.md    -> lib/generated-content.js 的 RULES_TEXT
+ *   content/collab-rules.md    -> 按 dsh 平台渲染后进 lib/generated-content.js 的 RULES_TEXT
  *   content/roles/<角色>.md     -> lib/generated-content.js 的 ROLES[].persona
  *   cordis.patch.yml           -> 只插入 `collab-mode` 一行
  *
@@ -108,12 +108,70 @@ function readManifest() {
   return manifest
 }
 
+/**
+ * 按平台渲染 `content/collab-rules.md`（规则文本单一来源）。
+ *
+ * 占位符语法约定（ZCode 侧 `zcode-collab/scripts/sync_from_manifest.py`
+ * 的 `render_rules()` 必须与此处逐字一致地实现同一语义）：
+ *
+ *   `{{NAME}}`            行内替换：取 `manifest.rules.placeholders[NAME][platform]`，
+ *                         取值一律来自 manifest，本文件不写死任何角色名或文案。
+ *   `{{#platform}}` 块    平台块：起始行与结束行各占一整行（行内无其他内容）。
+ *                         当前平台命中 → 去掉两行标记、保留块内内容；
+ *                         未命中 → 整块删除，并连同块前的一个空行一起删掉
+ *                         （源里用「空行 + 块」表示该块独占一段）。
+ *
+ * 渲染后若仍残留 `{{` 一律抛错（占位符名拼错、块未闭合都会在这里暴露）。
+ */
+function renderRules(text, platform, placeholders) {
+  const lines = text.split('\n')
+  const out = []
+  let skipping = null
+  for (const line of lines) {
+    const open = /^\{\{#([A-Za-z0-9_-]+)\}\}$/.exec(line)
+    if (open !== null && skipping === null) {
+      if (open[1] === platform) continue
+      skipping = open[1]
+      if (out.length > 0 && out[out.length - 1].trim() === '') out.pop()
+      continue
+    }
+    const close = /^\{\{\/([A-Za-z0-9_-]+)\}\}$/.exec(line)
+    if (close !== null) {
+      if (skipping !== null) {
+        if (close[1] !== skipping) throw new Error(`平台块 {{#${skipping}}} 被 {{/${close[1]}}} 关闭，标签不匹配`)
+        skipping = null
+        continue
+      }
+      if (close[1] === platform) continue
+      throw new Error(`出现孤立的平台块结束标记 {{/${close[1]}}}（没有对应的 {{#${close[1]}}}）`)
+    }
+    if (skipping !== null) continue
+    out.push(line)
+  }
+  if (skipping !== null) throw new Error(`平台块 {{#${skipping}}} 没有闭合的 {{/${skipping}}}`)
+
+  const rendered = out.join('\n').replace(/\{\{([A-Za-z0-9_-]+)\}\}/g, (raw, name) => {
+    const value = placeholders?.[name]?.[platform]
+    if (typeof value !== 'string' || value === '') {
+      throw new Error(`占位符 ${raw} 在 manifest.rules.placeholders 里没有 ${platform} 取值`)
+    }
+    return value
+  })
+  const left = /\{\{[^}]*\}\}/.exec(rendered)
+  if (left !== null) throw new Error(`渲染 ${platform} 规则文本后仍有占位符残留：${left[0]}`)
+  return rendered
+}
+
 syncContent()
 const manifest = readManifest()
 
 /* ---------- 产物一：lib/generated-content.js ---------- */
 
-const rules = readContent(join('content', manifest.rules.file))
+const rules = renderRules(
+  readContent(join('content', manifest.rules.file)),
+  'dsh',
+  manifest.rules.placeholders,
+)
 const roles = manifest.roles.map((role) => {
   if (typeof role.key !== 'string' || role.key === '') throw new Error('manifest role is missing "key"')
   if (typeof role.file !== 'string' || role.file === '') throw new Error(`manifest role "${role.key}" is missing "file"`)
