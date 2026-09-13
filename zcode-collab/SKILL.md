@@ -27,6 +27,11 @@ license: MIT
 | 部署流程 / 双钢人决策（本文件） | `zcode-collab/SKILL.md` | 直接改，重跑部署 |
 | 四个钩子 | `zcode-collab/hooks/*.ps1` | 复制到 `~/.zcode/cli/hooks/` |
 
+**关于角色数**：`content/roles/` 里是 **5 份源**，但**本机 ZCode 部署后是 7 个文件**——
+advisor 一份源在 ZCode 侧拆成 **advisor-A / advisor-B / advisor-C 三席**
+（各绑不同厂商的模型，用于"圆桌"同时问三家）。DSH 侧则是 **5 个工具**（一个 advisor，
+模型可在面板随时改）。**这是设计差异，不是缺陷**，不要试图"对齐"它们。
+
 ⚠️ **改了角色提示词后，`~/.zcode/agents/*.md` 不会自动更新**——那些是部署产物。
 必须跑 `python scripts/sync-agents.py .. --write` 把新正文推过去（它只换正文，
 保留各文件的 `model:` / `color:`），然后**重启 ZCode 或新开会话**才生效。

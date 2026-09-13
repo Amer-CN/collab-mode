@@ -83,7 +83,8 @@
       "file": "roles/advisor.md",
       "dsh": {
         "toolName": "advisor",
-        "readonly": true
+        "readonly": true,
+        "seatNote": "DSH 侧只有一个 advisor 工具（不拆三席）：模型可在设置面板随时改，要三家意见就调三次并各自指定模型。因此 DSH 侧角色数是 5，ZCode 侧是 7。"
       },
       "zcode": {
         "description": "独立顾问。用户想听多方意见时调用。只给判断和理由，不写代码。",
@@ -92,7 +93,8 @@
           "Read"
         ],
         "injectAgentsMd": false,
-        "nameNote": "另两个文件把 name 改为 advisor-B / advisor-C，其余完全相同"
+        "nameNote": "另两个文件把 name 改为 advisor-B / advisor-C，其余完全相同",
+        "seatNote": "ZCode 侧部署时拆成三席（advisor-A/B/C，仅 name 不同），因为 ZCode 的子智能体是静态文件、想同时问三家就得各绑一个模型。"
       }
     },
     {
