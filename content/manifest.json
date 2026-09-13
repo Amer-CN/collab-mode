@@ -1,12 +1,8 @@
 {
-  "version": "1.3.0",
+  "version": "1.4.0",
   "rules": {
     "file": "collab-rules.md",
     "placeholders": {
-      "ADVISOR": {
-        "dsh": "`advisor`",
-        "zcode": "`advisor-A` / `advisor-B` / `advisor-C`"
-      },
       "GENERIC": {
         "dsh": "通用子智能体",
         "zcode": "`general-purpose`"
@@ -14,10 +10,6 @@
       "EXPLORE": {
         "dsh": "只读探索类子智能体",
         "zcode": "`Explore` 或 `general-purpose`"
-      },
-      "ADVISOR_CALL": {
-        "dsh": "分别调用 `advisor` 若干轮，并在设置面板为每轮换不同厂商的模型",
-        "zcode": "同时调用 `advisor-A`、`advisor-B` 和 `advisor-C` 各出一轮意见；三席必须配置为不同厂商的模型，否则圆桌变复读"
       },
       "STEELMAN_TAIL": {
         "dsh": "。",
@@ -106,7 +98,12 @@
       "dsh": {
         "toolName": "advisor",
         "readonly": true,
-        "seatNote": "DSH 侧只有一个 advisor 工具（不拆三席）：模型可在设置面板随时改，要三家意见就调三次并各自指定模型。因此 DSH 侧角色数是 5，ZCode 侧是 7。"
+        "seats": [
+          "advisor-A",
+          "advisor-B",
+          "advisor-C"
+        ],
+        "seatNote": "DSH 侧与 ZCode 侧一样拆三席（advisor-A / advisor-B / advisor-C，三条 dsh-tool-subagent 实例行，persona 同一份），面板上给三席各配一个厂商的模型。2026-09-13 起 DSH 圆桌与 ZCode 同体验：一次性配好三厂商，之后一句话同时问三家。"
       },
       "zcode": {
         "description": "独立顾问。用户想听多方意见时调用。只给判断和理由，不写代码。",
@@ -116,7 +113,7 @@
         ],
         "injectAgentsMd": false,
         "nameNote": "另两个文件把 name 改为 advisor-B / advisor-C，其余完全相同",
-        "seatNote": "ZCode 侧部署时拆成三席（advisor-A/B/C，仅 name 不同），因为 ZCode 的子智能体是静态文件、想同时问三家就得各绑一个模型。"
+        "seatNote": "ZCode 侧部署时拆成三席（advisor-A/B/C，仅 name 不同），因为 ZCode 的子智能体是静态文件、想同时问三家就得各绑一个模型。DSH 侧同样拆三席（三条 dsh-tool-subagent 实例行，面板各配一个厂商）——两侧部署后都是 7 个。"
       }
     },
     {

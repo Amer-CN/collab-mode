@@ -29,12 +29,17 @@ window.__ModuleLoader__.load({
     const NS = 'collab-mode'
     const SELFCHECK_URL = '/api/collab-mode/selfcheck'
 
-    /** 五个角色：与 Host 半侧 build.mjs 的 ROLES 同序，用于渲染五行。 */
+    /**
+     * 七个角色行：与 Host 半侧 build.mjs 展开出的 ROLES 同序，用于渲染七行。
+     * advisor 一份源拆三席（advisor-A/B/C），三席 persona 同文、各配一个厂商。
+     */
     const ROLE_ROWS = [
       { key: 'executor', label: 'executor', writable: true },
       { key: 'code-reviewer', label: 'code-reviewer', writable: false },
       { key: 'researcher', label: 'researcher', writable: false },
-      { key: 'advisor', label: 'advisor', writable: false },
+      { key: 'advisor-A', label: 'advisor-A', writable: false },
+      { key: 'advisor-B', label: 'advisor-B', writable: false },
+      { key: 'advisor-C', label: 'advisor-C', writable: false },
       { key: 'vision-reader', label: 'vision-reader', writable: false },
     ]
 
@@ -100,7 +105,7 @@ window.__ModuleLoader__.load({
 
     const h = react.createElement
 
-    /** 一个空草稿：五个角色都留空（= 继承父会话路由）+ 三个开关默认开 + 阈值 3。 */
+    /** 一个空草稿：七个角色都留空（= 继承父会话路由）+ 三个开关默认开 + 阈值 3。 */
     function emptyDraft() {
       const routes = {}
       for (const row of ROLE_ROWS) {
@@ -257,7 +262,7 @@ window.__ModuleLoader__.load({
           'div',
           { className: 'dshcm-footer' },
           h('button', { type: 'button', className: 'dshcm-btn dshcm-discard', onClick: onRefresh, disabled: busy }, '刷新自检'),
-          h('button', { type: 'button', className: 'dshcm-btn dshcm-discard', onClick: onProbe, disabled: busy || props.probing }, props.probing ? '探测中…' : '探测五个角色'),
+          h('button', { type: 'button', className: 'dshcm-btn dshcm-discard', onClick: onProbe, disabled: busy || props.probing }, props.probing ? '探测中…' : '探测七个角色'),
         ),
         probe === null ? null : h('p', { className: probe.ok ? 'dshcm-note' : 'dshcm-error' }, probe.message),
       )
@@ -341,7 +346,7 @@ window.__ModuleLoader__.load({
         const missing = result.value.roles.filter((r) => !r.registered).map((r) => r.tool)
         setProbe(
           missing.length === 0
-            ? { ok: true, message: `五个角色工具均已注册：${result.value.roles.map((r) => r.tool).join(' / ')}` }
+            ? { ok: true, message: `七个角色工具均已注册：${result.value.roles.map((r) => r.tool).join(' / ')}` }
             : { ok: false, message: `以下角色工具未注册：${missing.join(' / ')}` },
         )
         setProbing(false)

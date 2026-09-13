@@ -169,7 +169,7 @@ function makeCtx(services = {}) {
       },
       get: (name) => services[name],
       // 自检区用 ctx.tools.get(name) 判断「工具是否真的注册了」。夹具给一个可配置的桩，
-      // 默认「五个角色工具都已注册」。
+      // 默认「七个角色工具都已注册」。
       tools: services.tools ?? { get: (toolName) => (toolName === undefined ? undefined : { name: toolName }) },
     },
     injected,
@@ -372,10 +372,16 @@ async function verifyPanelMechanism() {
 
   check('注册了 collab-mode 设置命名空间', settings.sections.length === 1 && settings.sections[0].ns === 'collab-mode', JSON.stringify(settings.sections.map((s) => s.ns)))
 
-  // T9：五个角色行由插件用 loader.create 创建（不是补丁 insert）。
+  // T9：七个角色行由插件用 loader.create 创建（不是补丁 insert）。
+  // advisor 一份源拆三席（advisor-A/B/C），因此行 id 是 collab-advisor-A/B/C。
   const ids = loader.calls.create.slice().sort()
-  check('用 loader.create 建了 5 行', ids.length === 5, JSON.stringify(ids))
-  check('行 id 与 v0.1.0 同名', ids.join(',') === 'collab-advisor,collab-code-reviewer,collab-executor,collab-researcher,collab-vision-reader', ids.join(','))
+  check('用 loader.create 建了 7 行', ids.length === 7, JSON.stringify(ids))
+  check(
+    '行 id 与展开后的角色 key 同名',
+    ids.join(',') ===
+      'collab-advisor-A,collab-advisor-B,collab-advisor-C,collab-code-reviewer,collab-executor,collab-researcher,collab-vision-reader',
+    ids.join(','),
+  )
   const executorRow = loader.entries.get('collab-executor')
   check('executor 行 name 是 dsh-tool-subagent', executorRow?.options?.name === '@deepseek-ai/dsh-tool-subagent', executorRow?.options?.name)
   check('executor 行 toolName 是 executor', executorRow?.options?.config?.toolName === 'executor', executorRow?.options?.config?.toolName)
@@ -392,7 +398,9 @@ async function verifyPanelMechanism() {
       executor: { provider: 'openai', model: 'gpt-5', reasoningEffort: 'high', maxTokens: 4096 },
       'code-reviewer': { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
       researcher: { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
-      advisor: { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
+      'advisor-A': { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
+      'advisor-B': { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
+      'advisor-C': { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
       'vision-reader': { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
     },
     gate: false,
@@ -411,7 +419,7 @@ async function verifyPanelMechanism() {
   check('改写后的 agentOptions.reasoningEffort 正确', executorUpdate?.options?.config?.agentOptions?.reasoningEffort === 'high')
   check('改写后的 agentOptions.maxTokens 正确', executorUpdate?.options?.config?.agentOptions?.maxTokens === 4096)
   check('改写后仍保留 persona', typeof executorUpdate?.options?.config?.persona === 'string' && executorUpdate.options.config.persona.length > 50)
-  check('留空的角色行不被改写', loader.calls.update.filter((c) => c.id === 'collab-advisor').length === 0, JSON.stringify(loader.calls.update.map((c) => c.id)))
+  check('留空的角色行不被改写', loader.calls.update.filter((c) => c.id.startsWith('collab-advisor-')).length === 0, JSON.stringify(loader.calls.update.map((c) => c.id)))
 
   // 面板关掉 gate → 拦截不再发生。
   const prePanel = panelCtx.handler('tools/pre-execute')
@@ -509,7 +517,7 @@ async function verifyPanelMechanism() {
     route.handler(req('GET'), res)
     check('栅栏放行时返回 200', res.state.statusCode === 200, `status=${res.state.statusCode}`)
     const parsed = JSON.parse(String(res.state.body))
-    check('自检数据含五个角色', Array.isArray(parsed.value?.roles) && parsed.value.roles.length === 5, String(parsed.value?.roles?.length))
+    check('自检数据含七个角色', Array.isArray(parsed.value?.roles) && parsed.value.roles.length === 7, String(parsed.value?.roles?.length))
     check('自检数据带版本', typeof parsed.value?.version === 'string' && parsed.value.version !== '', parsed.value?.version)
   }
 

@@ -18,7 +18,7 @@ DeepSeek Harness 插件：把 ZCode 侧那套「协作模式」搬到 DSH 上。
 
 | # | 内容 | 实现落点 |
 |---|---|---|
-| 1 | 五个角色子智能体工具 | 插件用 `ctx.loader.create()` 自己拥有的五行 `@deepseek-ai/dsh-tool-subagent` |
+| 1 | 七个角色子智能体工具 | 插件用 `ctx.loader.create()` 自己拥有的七行 `@deepseek-ai/dsh-tool-subagent`（advisor 一份源展开成 advisor-A/B/C 三席） |
 | 2 | 协作纪律系统提示段 | `ctx.systemPrompt.section` |
 | 3 | 改动前拦截 + 工具调用审计 | `tools/pre-execute` / `tools/post-execute` |
 | 4 | 轮次结束告警 | `agent/turn-stopping` |
@@ -54,9 +54,9 @@ dsh plugin --profile web remove dsh-collab-mode
 
 | 区块 | 内容 | 落点 |
 |---|---|---|
-| A 角色路由 | 五行 × 供应商 / 模型 / 推理强度 / maxTokens，**留空 = 继承当前会话模型** | settings 命名空间 `collab-mode` |
+| A 角色路由 | 七行 × 供应商 / 模型 / 推理强度 / maxTokens，**留空 = 继承当前会话模型**（advisor 三席各配一个厂商） | settings 命名空间 `collab-mode` |
 | B 纪律开关 | `gate` / `audit` / `warnOnTurnEnd` + 未声明文件阈值 + 审计目录 | 同上；`cordis.patch.yml` 里的值降级为默认值 |
-| C 自检 | 插件版本、提示段字符数、五个角色工具**是否已注册**、各自**实际生效路由**、审计目录、最近一条审计记录、刷新与探测按钮 | 宿主只读路由 `GET /api/collab-mode/selfcheck` |
+| C 自检 | 插件版本、提示段字符数、七个角色工具**是否已注册**、各自**实际生效路由**、审计目录、最近一条审计记录、刷新与探测按钮 | 宿主只读路由 `GET /api/collab-mode/selfcheck` |
 | D 角色定义 | 每行的 loader 行 id / 是否运行 / toolFilter 条数 / persona 字符数（只读） | 同一自检路由 |
 
 A/B 的读写走**原生 client settings scope**（`ctx.settingsScope.bind`），不经过自建 HTTP bridge；`unset` 用于「留空」，因此清空字段是退回组合层默认值，而不是写一个空串进用户层。
@@ -89,9 +89,9 @@ Cordis 的 `ctx.get(name)` **不参与依赖等待**：`ServiceRegistry.notify` 
 
 面板保存 → settings 值变化 → 插件把每行角色的 `agentOptions` 热写进对应 loader entry 的
 `config` → `loader.update(id, { config })` 重启那一行 → `dsh-tool-subagent` 用新路由重建工具。
-**不落盘、不动 `cordis.patch.yml`**，因此不需要重述五个角色约 10KB 的 persona。
+**不落盘、不动 `cordis.patch.yml`**，因此不需要重述七个角色约 10KB 的 persona。
 
-⚠ **为什么五个角色行由插件 `ctx.loader.create()` 拥有，而不是 `cordis.patch.yml` 的 `insert`：**
+⚠ **为什么七个角色行由插件 `ctx.loader.create()` 拥有，而不是 `cordis.patch.yml` 的 `insert`：**
 
 `EntryTree.update()`（也就是 `loader.update`）结尾会无条件调 `source.tree.write()`
 （`cordis-plugin-loader/src/config/tree.ts`）。而 `tree` 是谁取决于 entry 挂在哪个 group：
@@ -129,17 +129,18 @@ A/B 能走原生 scope，但「工具到底注册没有 / 实际生效什么路�
 离线夹具对「401 拒绝 / 放行 200 / 非 GET 405 / 缺 connection 时不注册」四条都有断言。
 
 
-## 1. 五个角色工具
+## 1. 七个角色工具
 
 | 工具名 | 职责 | 权限 |
 |---|---|---|
 | `executor` | 按简报执行改动 | 可写 |
 | `code-reviewer` | 独立审查：只看简报与仓库实际改动，不看执行者自述 | 只读 |
 | `researcher` | 只读调研：本地代码库、互联网、GitHub | 只读 |
-| `advisor` | 只给判断与理由，不写代码 | 只读 |
+| `advisor-A` / `advisor-B` / `advisor-C` | 圆桌三席：只给判断与理由，不写代码（三席共用 `content/roles/advisor.md` 一份 persona，面板上各配一个厂商） | 只读 |
 | `vision-reader` | 识图：只返回客观描述，不做分析建议 | 只读 |
 
 - 工具名与 ZCode 侧完全一致，同一份规则文本在两个 harness 上指同一角色。
+- **advisor 一份源拆三席**：`content/manifest.json` 的 `dsh.seats` 驱动 `build.mjs` 展开成三条 loader 行，因此两侧部署后都是 7 个。
 - **权限由 DSH 的工具注册表强制**：只读角色通过 `@deepseek-ai/dsh-tool-subagent` 的 `toolFilter.deny` 摘掉写操作工具，不是写在提示词里求模型自觉。
 - 每个角色的 persona 与默认模型通过插件配置项暴露（见下文「配置」）。
 - 子智能体继承父会话预设，因此 `maxDepth: 1` 关掉递归：角色子智能体不能再往下派。
@@ -200,7 +201,7 @@ A/B 能走原生 scope，但「工具到底注册没有 / 实际生效什么路�
     logDir: C:/Users/Admin/.dsh/hooks
 ```
 
-角色行（`collab-executor` / `collab-code-reviewer` / `collab-researcher` / `collab-advisor` / `collab-vision-reader`）暴露 `provider`、`toolName`、`backgroundMode`、`maxDepth`、`agentOptions{provider,model}`、`toolFilter{allow,deny}`、`persona`。默认不写 `agentOptions`，即子智能体继承父会话的模型路由；要分角色指定模型时：
+角色行（`collab-executor` / `collab-code-reviewer` / `collab-researcher` / `collab-advisor-A` / `collab-advisor-B` / `collab-advisor-C` / `collab-vision-reader`）暴露 `provider`、`toolName`、`backgroundMode`、`maxDepth`、`agentOptions{provider,model}`、`toolFilter{allow,deny}`、`persona`。默认不写 `agentOptions`，即子智能体继承父会话的模型路由；要分角色指定模型时：
 
 ```yaml
 - id: collab-researcher
@@ -225,7 +226,7 @@ A/B 能走原生 scope，但「工具到底注册没有 / 实际生效什么路�
 ```
 content/manifest.json     ── 角色清单 + 平台差异（唯一事实源）
 content/collab-rules.md   ─┐
-content/roles/*.md        ─┴─ node build.mjs ─┬─ lib/generated-content.js （提示段正文 + 五角色的 persona/deny 名单）
+content/roles/*.md        ─┴─ node build.mjs ─┬─ lib/generated-content.js （提示段正文 + 七角色的 persona/deny 名单）
                                               └─ cordis.patch.yml          （只插入 collab-mode 一行）
 ```
 
@@ -262,7 +263,7 @@ ZCode skill 侧另有一份**手写搬运**的副本。手工同步两份文本�
 4. 两个生成物文件头都带「请勿手改」告示；
 5. 每个角色的 `zcode` 块字段齐备（`description` / `color` / `tools` / `injectAgentsMd`）。
 
-⚠ 五个角色行**不在** `cordis.patch.yml` 里（v0.2.0 起由插件用 `ctx.loader.create()` 拥有，
+⚠ 七个角色行**不在** `cordis.patch.yml` 里（v0.2.0 起由插件用 `ctx.loader.create()` 拥有，
 原因见上文「角色路由怎么真正下发」）。因此 `dsh --profile web --dump-config` 只能看到
 `collab-mode` 一行 —— 角色行的存在性要看自检区（C 区块）或
 `GET /api/collab-mode/selfcheck` 的 `roles[].entryPresent / active`。
@@ -271,11 +272,11 @@ ZCode skill 侧另有一份**手写搬运**的副本。手工同步两份文本�
 
 - **只读名单依赖工具名**：`toolFilter.deny` 里的名字必须真实存在，见上文。
 - **`subagent` 无法被只读过滤器摘掉**：本机预设把 `tool-subagent` 那行配成 `modelSelectionSettings: true`，该工具会注册进**每个 agent 自己的层**；而 `@deepseek-ai/dsh-tools` 的 `restrict()` 只认继承来的名字（global + 祖先层），明确拒绝 scope-local 名字。实测把它放进 `deny` 会让每次委派都抛 `tools.restrict() names unknown global tool "subagent"`。
-  影响面：只读角色**自己**确实没有写工具（实测子智能体列出的工具集里没有 `write`/`edit`/`pwsh`），但它若主动去用预设那个 `subagent` 工具往下再派一层，**孙代不会继承这里的 `toolFilter`**（`dsh-subagent` 的委派只延续 sandbox/approval 两项策略，不延续 persona/toolFilter），那一层就不受只读约束了。`maxDepth: 1` 只管住本插件这五个工具自身的递归深度。
+  影响面：只读角色**自己**确实没有写工具（实测子智能体列出的工具集里没有 `write`/`edit`/`pwsh`），但它若主动去用预设那个 `subagent` 工具往下再派一层，**孙代不会继承这里的 `toolFilter`**（`dsh-subagent` 的委派只延续 sandbox/approval 两项策略，不延续 persona/toolFilter），那一层就不受只读约束了。`maxDepth: 1` 只管住本插件这七个工具自身的递归深度。
   要彻底关掉这条路径，需要在预设平面把 `tool-subagent` 的 `maxDepth` 一起收紧，或改用不接受 `modelSelectionSettings` 的注册方式 —— 都属于改预设组合，不在本插件范围内。
 - **状态是进程内的**：`seen` / `changed` 按 sessionId 存在内存里，进程重启或会话恢复后从空开始（与 `@deepseek-ai/dsh-repeat-tool-reminder` 的取舍一致）。审计日志是落盘的，可追。
 - **改代码后无法在运行中的进程里热更新**：cordis 的 HMR（`root: []`）只监听补丁文件，不监听模块文件，且 loader 复用已解析包的 ESM 模块缓存。改完插件代码要重启 `dsh web` 才生效。
-- **不含 `/roundtable` 命令**：任务书第 4 项标为「建议，可选」，本次未实现。多方意见目前靠重复调用 `advisor` 实现，规则文本已如此描述。
+- **不含 `/roundtable` 命令**：任务书第 4 项标为「建议，可选」，本次未实现。多方意见靠同时调用 `advisor-A` / `advisor-B` / `advisor-C` 实现，规则文本已如此描述。
 - **不修改任何出厂预设**：插件走 profile bundle 层（Host 平面），与 agent preset 无关。
 
 ## 版本

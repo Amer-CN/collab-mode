@@ -4,7 +4,7 @@
  *
  * 为什么需要它：v0.3.0 之前，角色清单在 `build.mjs`、正文在 `content/roles/*.md`、
  * ZCode skill 侧另有一份手写搬运的副本 —— 手工同步两份文本，丢了规则也没人发现。
- * 本脚本把「三处角色数必须相等」「manifest 声明的文件必须存在且非空」
+ * 本脚本把「角色数：源 5 份、两侧部署各 7 个」「manifest 声明的文件必须存在且非空」
  * 「生成物不得被手工编辑」「规则文本占位符取值齐全、两侧产物无残留」
  * 变成可执行的断言。
  *
@@ -74,11 +74,27 @@ for (const role of manifest.roles) {
   }
 }
 
-/* ---- 3. 三处角色数必须相等 ---- */
+/* ---- 3. 角色数：源 5 份，两侧部署各 7 个 ---- */
 
-console.log('\n[2] 三处角色数相等：manifest == content/roles/*.md == 生成物 ROLES == 面板 ROLE_ROWS')
+console.log('\n[2] 角色数：content/roles/*.md 源 5 份 → DSH 生成物 ROLES / 面板 ROLE_ROWS / ZCode agent-*.md 各 7 个')
 
 const manifestKeys = manifest.roles.map((r) => r.key).sort()
+
+/**
+ * DSH 侧展开后的角色 key：`dsh.seats` 非空时按席位展开（advisor 一份源出三席），
+ * 否则就是角色 key 本身。与 build.mjs 的 dshSeats() 同语义。
+ */
+function dshExpandedKeys() {
+  const keys = []
+  for (const role of manifest.roles) {
+    const seats = role.dsh?.seats
+    if (seats === undefined) keys.push(role.key)
+    else if (Array.isArray(seats) && seats.length > 0) keys.push(...seats)
+    else keys.push(role.key)
+  }
+  return keys.sort()
+}
+const expandedKeys = dshExpandedKeys()
 
 // content/roles/ 目录里实际存在的 .md 文件数
 const { readdirSync } = await import('node:fs')
@@ -86,14 +102,23 @@ const onDisk = readdirSync(join(root, 'content', 'roles'))
   .filter((f) => f.endsWith('.md'))
   .map((f) => f.replace(/\.md$/, ''))
   .sort()
-check('content/roles/*.md 数量 == manifest.roles 数量', onDisk.length === manifestKeys.length, `磁盘 ${onDisk.length} vs manifest ${manifestKeys.length}`)
+check('content/roles/*.md 数量 == manifest.roles 数量（源 5 份）', onDisk.length === manifestKeys.length, `磁盘 ${onDisk.length} vs manifest ${manifestKeys.length}`)
+check('源角色数 == 5', manifestKeys.length === 5, String(manifestKeys.length))
 check('content/roles/*.md 文件名集合 == manifest keys', JSON.stringify(onDisk) === JSON.stringify(manifestKeys), `磁盘 ${onDisk.join(',')} vs manifest ${manifestKeys.join(',')}`)
 
-// 生成物 lib/generated-content.js 的 ROLES
+// 生成物 lib/generated-content.js 的 ROLES（= DSH 侧部署数）
 const generated = await import(new URL('../lib/generated-content.js', import.meta.url).href)
 const generatedKeys = generated.ROLES.map((r) => r.key).sort()
-check('生成物 ROLES 数量 == manifest.roles 数量', generatedKeys.length === manifestKeys.length, `生成物 ${generatedKeys.length} vs manifest ${manifestKeys.length}`)
-check('生成物 ROLES keys == manifest keys', JSON.stringify(generatedKeys) === JSON.stringify(manifestKeys), `生成物 ${generatedKeys.join(',')}`)
+check('生成物 ROLES 数量 == 展开后的角色数', generatedKeys.length === expandedKeys.length, `生成物 ${generatedKeys.length} vs 展开 ${expandedKeys.length}`)
+check('生成物 ROLES keys == 展开后的角色 keys', JSON.stringify(generatedKeys) === JSON.stringify(expandedKeys), `生成物 ${generatedKeys.join(',')}`)
+check('DSH 侧部署数 == 7', generatedKeys.length === 7, String(generatedKeys.length))
+check('生成物含 advisor 三席', ['advisor-A', 'advisor-B', 'advisor-C'].every((s) => generatedKeys.includes(s)), generatedKeys.join(','))
+{
+  // 三席 persona 必须同文（共用 content/roles/advisor.md 一份源）
+  const personaOf = (key) => generated.ROLES.find((r) => r.key === key)?.persona
+  const seats = ['advisor-A', 'advisor-B', 'advisor-C'].map(personaOf)
+  check('advisor 三席 persona 同文', seats[0] !== undefined && seats[0] === seats[1] && seats[1] === seats[2], `长度 ${seats.map((p) => (typeof p === 'string' ? p.length : 'n/a')).join('/')}`)
+}
 
 // 面板 ROLE_ROWS（lib/client.js 里那张表）
 const clientSource = readFileSync(join(root, 'lib', 'client.js'), 'utf8')
@@ -101,8 +126,22 @@ const roleRowsBlock = clientSource.match(/const ROLE_ROWS = \[([\s\S]*?)\n\s*\]/
 check('lib/client.js 里能找到 ROLE_ROWS 表', roleRowsBlock !== null, 'not found')
 if (roleRowsBlock !== null) {
   const clientKeys = [...roleRowsBlock[1].matchAll(/key:\s*'([^']+)'/g)].map((m) => m[1]).sort()
-  check('面板 ROLE_ROWS 数量 == manifest.roles 数量', clientKeys.length === manifestKeys.length, `面板 ${clientKeys.length} vs manifest ${manifestKeys.length}`)
-  check('面板 ROLE_ROWS keys == manifest keys', JSON.stringify(clientKeys) === JSON.stringify(manifestKeys), `面板 ${clientKeys.join(',')}`)
+  check('ROLES 数 == ROLE_ROWS 数', clientKeys.length === generatedKeys.length, `面板 ${clientKeys.length} vs 生成物 ${generatedKeys.length}`)
+  check('面板 ROLE_ROWS keys == 生成物 ROLES keys', JSON.stringify(clientKeys) === JSON.stringify(generatedKeys), `面板 ${clientKeys.join(',')}`)
+}
+
+// ZCode 侧部署数：references/agent-*.md（advisor 模板出三席，席位名由
+// sync_from_manifest.py 的 ADVISOR_SEATS 声明 —— 按那份声明数，不写死）
+{
+  const refDir = join(root, '..', 'zcode-collab', 'references')
+  const refFiles = readdirSync(refDir).filter((f) => /^agent-.*\.md$/.test(f))
+  const seatsScript = join(root, '..', 'zcode-collab', 'scripts', 'sync_from_manifest.py')
+  const seatCount = existsSync(seatsScript)
+    ? [...readFileSync(seatsScript, 'utf8').matchAll(/^\s*"[^"]+":\s*"advisor-[A-Za-z0-9_-]+",\s*$/gm)].length
+    : 0
+  // 模板文件 agent-advisor.md 本身算一席，另两席由部署步骤拆分
+  const deployed = refFiles.length + Math.max(0, seatCount - 1)
+  check('ZCode 侧部署数 == 7', deployed === 7, `references ${refFiles.length} 个模板 + 席位声明 ${seatCount} → ${deployed}`)
 }
 
 /* ---- 4. 生成物不得被手工编辑（用「重新构建后字节一致」判定） ---- */
@@ -183,6 +222,14 @@ for (const block of new Set(openBlocks)) {
   check(`平台块 {{#${block}}} 是 manifest 里有取值的平台`, Object.values(placeholders).some((v) => typeof v?.[block] === 'string'), block)
 }
 
+// 7.1b v1.4.0 起顾问角色两侧同名（advisor-A/B/C），不再需要 ADVISOR /
+// ADVISOR_CALL 两个占位符 —— manifest 里不许留，规则源里也不许再引用
+// （否则渲染时 check 会抛「没有 dsh 取值」，这条断言把事故提前到自检阶段）。
+for (const dead of ['ADVISOR', 'ADVISOR_CALL']) {
+  check(`manifest.rules.placeholders 无 ${dead}`, placeholders[dead] === undefined, JSON.stringify(placeholders[dead]))
+  check(`规则源无 {{${dead}}} 引用`, !rulesSource.includes(`{{${dead}}}`), rulesSource.match(new RegExp(`\\{\\{${dead}\\}\\}`))?.[0])
+}
+
 // 7.2 两份渲染产物均无 `{{` 残留
 const freshGenerated = await import(`${new URL('../lib/generated-content.js', import.meta.url).href}?drift=${Date.now()}`)
 const dshRules = freshGenerated.RULES_TEXT
@@ -209,12 +256,17 @@ for (const [label, text, shouldHave] of [
   }
 }
 
-// 7.3 圆桌条目在两侧都渲染出真实存在的角色名
+// 7.3 圆桌条目在两侧都渲染出真实存在的角色名，且两侧该行逐字一致
 const roundTableLine = (text) => text.split('\n').find((line) => line.includes('用户想听多方意见'))
 const backticked = (line) => [...line.matchAll(/`([A-Za-z0-9_-]+)`/g)].map((m) => m[1])
 
-// DSH 侧的真实角色名 = manifest 里声明的 dsh.toolName
-const dshNames = new Set(manifest.roles.map((r) => r.dsh.toolName))
+// DSH 侧的真实角色名 = 展开后的工具名（dsh.seats 非空时按席位展开，与 build.mjs 同语义）
+const dshNames = new Set()
+for (const role of manifest.roles) {
+  const seats = role.dsh?.seats
+  if (seats === undefined) dshNames.add(role.dsh.toolName)
+  else for (const seat of seats) dshNames.add(seat)
+}
 // ZCode 侧的真实角色名 = references/agent-*.md 的 frontmatter name；advisor 模板在
 // 部署时拆成三席，席位名（advisor-A/B/C）由 sync_from_manifest.py 的 ADVISOR_SEATS
 // 声明 —— 按那份声明解析，不把席位名写死在断言里。
@@ -232,6 +284,16 @@ if (zcodeRulesExists) {
     }
   }
   check('ZCode 侧解析出 advisor 三席名', zcodeNames.has('advisor-A') && zcodeNames.has('advisor-B') && zcodeNames.has('advisor-C'), [...zcodeNames].join(','))
+}
+// 圆桌行两侧必须逐字节一致（v1.4.0 起两侧同体验：都直书 advisor-A/B/C，
+// 不再有 {{ADVISOR_CALL}} 这类分叉取值）
+{
+  const dshLine = roundTableLine(dshRules)
+  const zcodeLine = roundTableLine(zcodeRules)
+  check('圆桌行两侧逐字一致', dshLine !== undefined && dshLine === zcodeLine, dshLine === zcodeLine ? '' : `DSH=${JSON.stringify(dshLine)} ZCode=${JSON.stringify(zcodeLine)}`)
+  for (const needle of ['同时调用 `advisor-A`、`advisor-B` 和 `advisor-C`', '三席必须配置为不同厂商']) {
+    check(`圆桌行含「${needle}」`, typeof dshLine === 'string' && dshLine.includes(needle), dshLine === undefined ? 'no line' : dshLine)
+  }
 }
 for (const [label, text, names] of [
   ['DSH', dshRules, dshNames],

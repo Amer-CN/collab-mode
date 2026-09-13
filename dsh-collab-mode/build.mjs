@@ -8,11 +8,11 @@
  *   cordis.patch.yml           -> 只插入 `collab-mode` 一行
  *
  * 改完 `content/` 必须重新运行 `node build.mjs`（等价于 `npm run build`），
- * 并用 `node scripts/check-drift.mjs` 校验三处角色数一致。
+ * 并用 `node scripts/check-drift.mjs` 校验角色数一致（源 5 份 → 两侧部署各 7 个）。
  * 两份产物都是生成物，禁止手改 —— 手改会在下一次构建时被覆盖，并让 ZCode 侧的
  * 同步失去意义（任务书设计决策 3：内容单一来源）。
  *
- * ⚠ v0.2.0 起，五个角色行**不再**由 cordis.patch.yml 插入，改由插件在运行时用
+ * ⚠ v0.2.0 起，角色行**不再**由 cordis.patch.yml 插入，改由插件在运行时用
  * `ctx.loader.create()` 自己拥有。原因见 cordis.patch.yml 顶部注释与 README
  * 「设置面板」一节：对补丁插入的行调 `loader.update` 会走 `Include.write()`，
  * 把整棵合成树回写进 profile 的 `cordis.yml`；插件自己 create 的行挂在 Loader 的
@@ -78,7 +78,7 @@ const MUTATING_TOOLS = [
 ]
 
 /**
- * 五个角色。`readonly: true` 的角色通过 `toolFilter.deny` 摘掉全部写操作工具，
+ * 角色（`readonly: true` 的）通过 `toolFilter.deny` 摘掉全部写操作工具，
  * 权限由 DSH 的工具注册表强制（不是写在提示词里求模型自觉）。
  *
  * `maxDepth: 1`：角色子智能体自己不能再往下派子智能体（子智能体继承父会话预设，
@@ -162,6 +162,49 @@ function renderRules(text, platform, placeholders) {
   return rendered
 }
 
+/**
+ * 一个角色在 DSH 侧展开成几行。
+ *
+ * 默认一行（`dsh.toolName`）。`dsh.seats` 非空时按席位展开：每个席位一行，
+ * `key` 与工具名都用席位名（advisor → advisor-A / advisor-B / advisor-C），
+ * persona 同文（三席共用 `content/roles/advisor.md` 一份源）。
+ * 面板的 ROLE_ROWS 与 loader 行 id 都按展开后的 key 走，因此两侧数量必须相等。
+ */
+function dshSeats(role) {
+  const seats = role.dsh.seats
+  if (seats === undefined) return [{ key: role.key, tool: role.dsh.toolName }]
+  if (!Array.isArray(seats) || seats.length === 0) {
+    throw new Error(`manifest role "${role.key}" 的 dsh.seats 必须是非空数组`)
+  }
+  return seats.map((seat) => {
+    if (typeof seat !== 'string' || seat === '') {
+      throw new Error(`manifest role "${role.key}" 的 dsh.seats 里有空席位名`)
+    }
+    return { key: seat, tool: seat }
+  })
+}
+
+/** 展开全部角色（manifest 5 条源 → DSH 侧 7 行）。 */
+function expandRoles(manifest) {
+  return manifest.roles.flatMap((role) => {
+    if (typeof role.key !== 'string' || role.key === '') throw new Error('manifest role is missing "key"')
+    if (typeof role.file !== 'string' || role.file === '') throw new Error(`manifest role "${role.key}" is missing "file"`)
+    if (typeof role.dsh !== 'object' || role.dsh === null) throw new Error(`manifest role "${role.key}" is missing "dsh"`)
+    if (typeof role.dsh.toolName !== 'string' || role.dsh.toolName === '') {
+      throw new Error(`manifest role "${role.key}" is missing "dsh.toolName"`)
+    }
+    if (typeof role.dsh.readonly !== 'boolean') throw new Error(`manifest role "${role.key}" is missing "dsh.readonly"`)
+    const persona = readContent(join('content', role.file))
+    return dshSeats(role).map((seat) => ({
+      key: seat.key,
+      tool: seat.tool,
+      readonly: role.dsh.readonly,
+      persona,
+      deny: role.dsh.readonly ? MUTATING_TOOLS : null,
+    }))
+  })
+}
+
 syncContent()
 const manifest = readManifest()
 
@@ -172,22 +215,7 @@ const rules = renderRules(
   'dsh',
   manifest.rules.placeholders,
 )
-const roles = manifest.roles.map((role) => {
-  if (typeof role.key !== 'string' || role.key === '') throw new Error('manifest role is missing "key"')
-  if (typeof role.file !== 'string' || role.file === '') throw new Error(`manifest role "${role.key}" is missing "file"`)
-  if (typeof role.dsh !== 'object' || role.dsh === null) throw new Error(`manifest role "${role.key}" is missing "dsh"`)
-  if (typeof role.dsh.toolName !== 'string' || role.dsh.toolName === '') {
-    throw new Error(`manifest role "${role.key}" is missing "dsh.toolName"`)
-  }
-  if (typeof role.dsh.readonly !== 'boolean') throw new Error(`manifest role "${role.key}" is missing "dsh.readonly"`)
-  return {
-    key: role.key,
-    tool: role.dsh.toolName,
-    readonly: role.dsh.readonly,
-    persona: readContent(join('content', role.file)),
-    deny: role.dsh.readonly ? MUTATING_TOOLS : null,
-  }
-})
+const roles = expandRoles(manifest)
 
 const generatedJs = `// 本文件由 build.mjs 从 content/ 生成，请勿手改。
 // 重新生成：node build.mjs
@@ -205,8 +233,9 @@ const patch = `# dsh-collab-mode bundle patch —— 本文件由 build.mjs 生�
 # profile 自己的 cordis.patch.yml → home 补丁 → --patch 覆盖层），因此协作模式对
 # 每个会话可见，不依赖会话选了哪个 agent preset。
 #
-# ⚠ 这里只插入插件自己一行。五个角色行（collab-executor / collab-code-reviewer /
-# collab-researcher / collab-advisor / collab-vision-reader）改由插件在运行时用
+# ⚠ 这里只插入插件自己一行。七个角色行（collab-executor / collab-code-reviewer /
+# collab-researcher / collab-advisor-A / collab-advisor-B / collab-advisor-C /
+# collab-vision-reader）改由插件在运行时用
 # ctx.loader.create() 创建，因为设置面板要按角色热改它们的 agentOptions：
 #
 #   补丁 insert 出来的行挂在文件后端 Include 的 root group 上，

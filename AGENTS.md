@@ -11,7 +11,7 @@
 |---|---|---|
 | `content/` | **唯一事实源**：协作纪律 + 五个角色提示词 + 平台差异清单 | 不直接安装，被两边消费 |
 | `zcode-collab/` | ZCode Skill（部署脚本 + 四个 PowerShell 钩子 + 双钢人决策） | ZCode、Claude Code、Codex 等 |
-| `dsh-collab-mode/` | DeepSeek Harness 插件（五角色工具 + 提示段 + 三个代码级钩子 + 设置面板） | DeepSeek Harness |
+| `dsh-collab-mode/` | DeepSeek Harness 插件（七角色工具 + 提示段 + 三个代码级钩子 + 设置面板） | DeepSeek Harness |
 
 **核心约定：改规则只改 `content/`，两边都是生成物。**
 
@@ -34,20 +34,21 @@ content/manifest.json ─── 角色清单 + 平台差异（工具名/只读�
 
 **为什么必须这样**：v0.3.0 之前两边靠手工同步，结果插件丢了 10 条规则（"不要 git commit""有立场禁止和稀泥""说真话"等）——因为插件那份是手写搬运的，不是生成的。v0.4.0 之前规则文本也是两份各自维护，结果 ZCode 侧的圆桌规则引用了不存在的角色名 `advisor`（实际叫 `advisor-A/B/C`），**圆桌调用不到任何东西**。**任何"手工改生成物"的行为都会重演这类事故。**
 
-### 角色数为什么两边不一样（5 vs 7）
+### 角色数：5 份源 → 两侧各 7 个
 
 | | 数量 | 组成 | 为什么 |
 |---|---|---|---|
 | `content/roles/` | **5 份源** | executor / code-reviewer / researcher / advisor / vision-reader | 唯一事实源，advisor 只有一份 |
-| **DSH 侧** | **5 个工具** | 同上（一个 `advisor`） | advisor 是**一个工具**，模型可在设置面板随时改；要三家意见就调三次并各自指定模型 |
+| **DSH 侧** | **7 个工具** | 同上 + **advisor-A / advisor-B / advisor-C 三席** | advisor 一份源拆三席：三条 `dsh-tool-subagent` 实例行（manifest 的 `dsh.seats` 驱动 `build.mjs` 展开），persona 同文，面板上各配一个厂商 |
 | **ZCode 侧** | **7 个文件** | 同上 + **advisor-A / advisor-B / advisor-C 三席** | ZCode 子智能体是**静态文件**，想同时问三家就得配三份、各绑一个模型 |
 
-**这是设计差异，不是缺陷**——不要给 DSH 加三席，也不要以为 ZCode 多了两个角色。
-manifest 里 advisor 条目的 `zcode.seatNote` / `dsh.seatNote` 有同样说明。
+**两侧部署后都是 7 个**。2026-09-13 起 DSH 圆桌与 ZCode 同体验：一次性配好三厂商，
+之后一句话同时问三家。manifest 里 advisor 条目的 `zcode.seatNote` / `dsh.seatNote`
+有同样说明。
 
-**规则文本里凡提到顾问角色，一律用 `{{ADVISOR}}` / `{{ADVISOR_CALL}}` 占位符**，
-渲染时按平台换成 `advisor` 或 `advisor-A/B/C`——否则会出现"规则引用一个不存在的角色名"
-（v0.4.0 之前 ZCode 侧的圆桌规则就是这样，导致圆桌调用不到任何东西）。
+**顾问角色两侧同名，直书即可**（`advisor-A` / `advisor-B` / `advisor-C`）——
+两侧部署后的工具名完全一致，规则文本不需要为它分叉。
+占位符只留给真正两侧分叉的措辞（如 `{{GENERIC}}` / `{{EXPLORE}}` / `{{STEELMAN_TAIL}}`）。
 
 ---
 
@@ -71,7 +72,8 @@ cd ..
 ### 改协作纪律 / 角色提示词（六步）
 
 **改规则文本时**：`content/collab-rules.md` 里两侧措辞不同的地方用占位符
-（`{{ADVISOR}}` 等，见第 1 节"平台占位符"），不要只写一侧的角色名。
+（`{{GENERIC}}` / `{{EXPLORE}}` / `{{STEELMAN_TAIL}}`，见第 1 节"平台占位符"）；
+顾问角色两侧同名（`advisor-A/B/C`），直书即可，不要为它造占位符。
 
 ```powershell
 # 0. 站在仓库根（含 AGENTS.md 的目录）
@@ -127,10 +129,12 @@ DSH 的 `link:` 指向 `dsh-collab-mode`，它加载磁盘文件；但**模块�
 
 改 `content/manifest.json`：
 - `roles[].key` / `roles[].file` / `roles[].dsh.toolName` / `roles[].dsh.readonly` — DSH 侧用
+- `roles[].dsh.seats` — DSH 侧席位展开（非空时 `build.mjs` 按席位出多行，advisor 用它出三席）
 - `roles[].zcode.description` / `.color` / `.tools` / `.injectAgentsMd` — ZCode 侧用
 - `roles[].zcode.toolsNote` / `.nameNote` — frontmatter 里的注释（条件信息，别丢）
 
-改完跑第 1 节的步骤。`check-drift.mjs` 会校验**四处角色数相等**（manifest / content/roles/*.md / 生成物 ROLES / 面板 ROLE_ROWS），少一处就报错。
+改完跑第 1 节的步骤。`check-drift.mjs` 会校验**角色数**：`content/roles/*.md` 源 5 份，
+DSH 生成物 `ROLES` / 面板 `ROLE_ROWS` / ZCode `agent-*.md` 各 7 个，少一处就报错。
 
 ### 平台占位符（v0.4.0，规则文本的两侧差异怎么表达）
 
@@ -139,11 +143,15 @@ DSH 的 `link:` 指向 `dsh-collab-mode`，它加载磁盘文件；但**模块�
 1. **行内替换** `{{NAME}}` —— 取值放 `content/manifest.json` 的 `rules.placeholders`：
    ```json
    "placeholders": {
-     "ADVISOR": { "dsh": "`advisor`", "zcode": "`advisor-A` / `advisor-B` / `advisor-C`" }
+     "GENERIC": { "dsh": "通用子智能体", "zcode": "`general-purpose`" }
    }
    ```
 2. **平台块** `{{#zcode}}…{{/zcode}}` —— 只有该平台才保留的内容（如引用 `decision-full.md`，
    那是 ZCode 独有的文件）；另一平台渲染时整块删除。
+
+**顾问角色不需要占位符**：两侧部署后工具名都是 `advisor-A` / `advisor-B` / `advisor-C`，
+规则文本里直书真名即可（v1.4.0 起 DSH 也拆三席，`{{ADVISOR}}` / `{{ADVISOR_CALL}}`
+两个键已删除）。
 
 **铁律**：占位符的**取值**只放 manifest，渲染代码里不写死任何角色名或文案；
 新增占位符必须 dsh、zcode 两侧都有取值（缺一 check-drift 会 FAIL）；
@@ -261,7 +269,7 @@ DSH 侧相反：`link:` 安装者改完仓库、重启 `dsh web` 即生效，无
 | `subagent` 工具不可被 `toolFilter` 限制 | DSH 预设把它注册进每个 agent 自己的层，而 `restrict()` 只认继承层名字。放进 deny 名单会让每次委派抛错。后果：只读角色的**孙代**不受只读约束 |
 | 模块代码不能热更新 | 改 `lib/` 必须重启 `dsh web` |
 | `tools/pre-execute` 不能改写参数 | DSH 有意为之。所以"面板改路由"必须走 `loader.update` 改角色行，不能拦截改写 |
-| `loader.update` 对补丁插入的行会回写合成树 | 会压平 bundle/profile/home 三层补丁。所以五个角色行由插件用 `ctx.loader.create()` 自己拥有（挂在 Loader root group，`write()` 是空实现） |
+| `loader.update` 对补丁插入的行会回写合成树 | 会压平 bundle/profile/home 三层补丁。所以七个角色行由插件用 `ctx.loader.create()` 自己拥有（挂在 Loader root group，`write()` 是空实现） |
 | 客户端 `inject` 必须声明 `settingsScope` | 用 `ctx.get()` 一次性读取会在服务晚到时永久降级（v0.2.0 的真实缺陷） |
 | 自检路由必须走认证栅栏 | `webServer.match()` 是 exact 优先，`/api/xxx` exact 路由会**绕过** `/api` prefix 上的认证。必须调 `connection.requestRejection(req)` |
 | `~/.zcode` 配置树在钩子里豁免 | 改协作系统自身的配置不被计数（v1.1.4 起）。代价：治理工具自身改动无机器门禁 |

@@ -84,7 +84,7 @@ dsh plugin --profile web add link:<克隆到的父目录>/collab-mode/dsh-collab
 
 | 能力 | 说明 |
 |---|---|
-| 🔨 **五个角色工具** | `executor`（可写）/ `code-reviewer` / `researcher` / `advisor` / `vision-reader`（只读），名字与 ZCode 侧完全一致 |
+| 🔨 **七个角色工具** | `executor`（可写）/ `code-reviewer` / `researcher` / `advisor-A` / `advisor-B` / `advisor-C`（圆桌三席）/ `vision-reader`（只读），名字与 ZCode 侧完全一致 |
 | 📋 **协作纪律提示段** | 与 ZCode 侧同一份规则文本，注入系统提示 |
 | 🚧 **改动前拦截** | 本会话改动 ≥3 个无简报声明的生产文件 → 拒绝该次写操作并列出文件名 |
 | 📝 **工具调用审计** | 每次调用追加一行 JSON（时间/工具/目标/成功/耗时）到 `~/.dsh/hooks/` |
@@ -115,7 +115,7 @@ cd dsh-collab-mode; node build.mjs; node scripts/check-drift.mjs
 | 🔍 **code-reviewer** | 监理：只认仓库实际改动，只判"够不够"，驳回须证据 | content/roles/code-reviewer.md |
 | 📚 **researcher** | 只读调研：本地代码库 + 互联网 + GitHub（有 MCP 就带） | content/roles/researcher.md |
 | 👁️ **vision-reader** | 识图员：主模型不支持看图时给它当眼睛（可选） | content/roles/vision-reader.md |
-| 🗣️ **advisor** | 独立顾问：只给判断和理由，禁止和稀泥（ZCode 侧三席圆桌） | content/roles/advisor.md |
+| 🗣️ **advisor-A/B/C** | 圆桌三席：各给判断和理由，禁止和稀泥（两侧都拆三席，各配一个厂商） | content/roles/advisor.md |
 | ⚖️ **双钢人决策** | "该不该做/选哪个"先走简版论证（crux + 反转条件 + 承诺窗口，≤300 字） | zcode-collab/SKILL.md + references/decision-full.md |
 
 ## 🚀 它怎么工作

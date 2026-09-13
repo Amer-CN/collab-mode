@@ -5,8 +5,9 @@
 # profile 自己的 cordis.patch.yml → home 补丁 → --patch 覆盖层），因此协作模式对
 # 每个会话可见，不依赖会话选了哪个 agent preset。
 #
-# ⚠ 这里只插入插件自己一行。五个角色行（collab-executor / collab-code-reviewer /
-# collab-researcher / collab-advisor / collab-vision-reader）改由插件在运行时用
+# ⚠ 这里只插入插件自己一行。七个角色行（collab-executor / collab-code-reviewer /
+# collab-researcher / collab-advisor-A / collab-advisor-B / collab-advisor-C /
+# collab-vision-reader）改由插件在运行时用
 # ctx.loader.create() 创建，因为设置面板要按角色热改它们的 agentOptions：
 #
 #   补丁 insert 出来的行挂在文件后端 Include 的 root group 上，
