@@ -1,8 +1,8 @@
 /**
  * dsh-collab-mode —— 把 ZCode 侧那套「协作模式」搬到 DeepSeek Harness。
  *
- * 本插件提供三样东西（五个角色子智能体工具由本包的 bundle patch
- * `cordis.patch.yml` 里的五行 `@deepseek-ai/dsh-tool-subagent` 提供）：
+ * 本插件提供三样东西（七个角色子智能体工具——advisor 一份 persona 源展开成三席——
+ * 由插件自己用 `ctx.loader.create()` 建行提供；`cordis.patch.yml` 里只有宿主行）：
  *
  *   1. 协作纪律系统提示段（`ctx.systemPrompt.section`），正文来自仓库 `content/collab-rules.md`。
  *   2. 改动前拦截 `tools/pre-execute`：本会话未声明生产文件累计到阈值 → deny，并列出文件名。
@@ -376,9 +376,9 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * 让五个角色行与面板值一致。
+   * 让七个角色行与面板值一致。
    *
-   * ⚠ 这五行由**插件自己**用 `ctx.loader.create()` 拥有，不走 cordis.patch.yml 的
+   * ⚠ 这七行由**插件自己**用 `ctx.loader.create()` 拥有，不走 cordis.patch.yml 的
    * `insert`。原因：补丁插入的行挂在文件后端 `Include` 的 root group 上，对它调
    * `loader.update` 会走 `EntryTree.update` 结尾的 `source.tree.write()`
    * → `Include.write()` → 把整棵合成树回写进 profile 的 `cordis.yml`，压平
@@ -453,7 +453,7 @@ export function apply(ctx, rawConfig) {
     })
   })
 
-  // 没有 settings 也要有五个角色工具（v0.1.0 行为不变）：先用组合层默认值建行。
+  // 没有 settings 也要有七个角色工具（v0.1.0 行为不变）：先用组合层默认值建行。
   void syncRoleRows(baseEntry.routes)
 
   ctx.logger?.info(
@@ -597,7 +597,7 @@ export function apply(ctx, rawConfig) {
 
   /* ---- 6. 自检桥（面板 C 区块的数据源） ---- */
 
-  /** 五个角色工具**实际**注册在哪、各自实际解析到的路由。 */
+  /** 七个角色工具**实际**注册在哪、各自实际解析到的路由。 */
   function inspectRoles() {
     const loader = ctx.get('loader')
     const rows = []
