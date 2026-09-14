@@ -780,6 +780,12 @@ async function verifyClientHalf() {
   check('推理强度旧值粘滞', source.includes('effortOptions'), 'not found')
   check('推理强度跟随模型', source.includes('model-efforts') && source.includes('fetchEfforts') && source.includes('effortSelect'), 'not found')
   check('档位默认有标记', source.includes('（默认）'), 'not found')
+  check('失效项有统一标记', source.includes('staleTag') && source.includes('失效，目录无此项'), 'not found')
+  check('失效占位不可提交', source.includes('isStale(e.target.value)'), 'not found')
+  check('失效占位红字样式', source.includes('option[value="stale"]'), 'not found')
+  check('供应商切换清空模型', source.includes("next.routes[rowKey].model = ''"), 'not found')
+  check('供应商切换清空档位', source.includes("next.routes[rowKey].reasoningEffort = ''"), 'not found')
+  check('不再用中性当前标记', !source.includes('（当前）'), 'found')
 }
 
 await verifyClientHalf()

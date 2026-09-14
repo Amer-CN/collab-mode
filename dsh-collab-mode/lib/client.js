@@ -100,7 +100,7 @@ window.__ModuleLoader__.load({
       '.dshcm-input,.dshcm-select{border:1px solid var(--dsw-alias-border-l2);font:inherit;color:var(--dsw-alias-label-primary);background:var(--dsw-specific-input-major);border-radius:6px;padding:5px 7px;font-size:13px;width:100%;box-sizing:border-box}',
       '.dshcm-select{color-scheme:light dark}',
       '.dshcm-select option,.dshcm-select optgroup{background-color:#fff;color:#1f2328}',
-      '.dshcm-select option[value="stale"]{color:var(--dsw-alias-state-error-primary)}',
+      '.dshcm-select option[value="stale"]{color:var(--dsw-alias-state-error-primary);font-weight:600}',
       '@media (prefers-color-scheme:dark){.dshcm-select{color-scheme:dark}.dshcm-select option,.dshcm-select optgroup{background-color:#1e1f24;color:#e8e8ea}}',
       '.dshcm-input:hover:not(:disabled),.dshcm-select:hover:not(:disabled){border-color:var(--dsw-alias-label-dimmed)}',
       '.dshcm-input:focus-visible,.dshcm-select:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}',
@@ -786,11 +786,15 @@ window.__ModuleLoader__.load({
             'select',
             {
               className: 'dshcm-select',
-              value: current,
+              // 失效占位项不可提交：选它等于什么都没选（守卫在 onChange 里）。
+              value: isStale(current) ? staleKey : current,
               disabled,
-              onChange: (e) => edit((next) => {
-                next.routes[rowKey].reasoningEffort = e.target.value
-              }),
+              onChange: (e) => {
+                if (isStale(e.target.value)) return
+                edit((next) => {
+                  next.routes[rowKey].reasoningEffort = e.target.value
+                })
+              },
             },
             ...options.map((o) => h('option', { key: o.value, value: o.value }, o.label)),
           ),
@@ -803,7 +807,16 @@ window.__ModuleLoader__.load({
           h('span', { className: 'dshcm-label' }, labelText),
           h(
             'select',
-            { className: 'dshcm-select', value, disabled, onChange: (e) => onPick(e.target.value) },
+            {
+              className: 'dshcm-select',
+              // 失效占位项不可提交：选它等于什么都没选（守卫在 onPick 里）。
+              value: isStale(value) ? staleKey : value,
+              disabled,
+              onChange: (e) => {
+                if (isStale(e.target.value)) return
+                onPick(e.target.value)
+              },
+            },
             ...options.map((o) => h('option', { key: o.value, value: o.value }, o.label)),
           ),
         )
@@ -825,7 +838,7 @@ window.__ModuleLoader__.load({
         return [
           selectField('供应商', route.provider, providerOptions(route.provider), (v) => edit((next) => {
             // 供应商一切换，旧模型必然是幽灵组合（大小写错位如 kimi-k3 vs KIMI-K3）——
-            // 直接清空逼重选，不给误导活路。这是"（当前）粘滞误导"事故的源头修复。
+            // 直接清空逼重选，不给误导活路。这是"幽灵组合误导"事故的源头修复。
             next.routes[rowKey].provider = v
             next.routes[rowKey].model = ''
             next.routes[rowKey].reasoningEffort = ''
