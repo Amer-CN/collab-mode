@@ -100,6 +100,7 @@ window.__ModuleLoader__.load({
       '.dshcm-input,.dshcm-select{border:1px solid var(--dsw-alias-border-l2);font:inherit;color:var(--dsw-alias-label-primary);background:var(--dsw-specific-input-major);border-radius:6px;padding:5px 7px;font-size:13px;width:100%;box-sizing:border-box}',
       '.dshcm-select{color-scheme:light dark}',
       '.dshcm-select option,.dshcm-select optgroup{background-color:#fff;color:#1f2328}',
+      '.dshcm-select option[value="stale"]{color:var(--dsw-alias-state-error-primary)}',
       '@media (prefers-color-scheme:dark){.dshcm-select{color-scheme:dark}.dshcm-select option,.dshcm-select optgroup{background-color:#1e1f24;color:#e8e8ea}}',
       '.dshcm-input:hover:not(:disabled),.dshcm-select:hover:not(:disabled){border-color:var(--dsw-alias-label-dimmed)}',
       '.dshcm-input:focus-visible,.dshcm-select:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}',
@@ -246,24 +247,30 @@ window.__ModuleLoader__.load({
       return ops
     }
 
-    /** 单个角色的 maxTokens 校验（编辑视图只拦这一行，不连坐其他角色）。 */
+    /**
+     * 单个角色的路由校验（编辑视图只拦这一行，不连坐其他角色）：
+     * maxTokens 必须是正数；reasoningEffort 必须在该模型 advertised 档位里。
+     */
     function roleInvalid(rowKey, route) {
       const maxTokens = route.maxTokens.trim()
       if (maxTokens !== '' && !(Number.isFinite(Number(maxTokens)) && Number(maxTokens) > 0)) {
         return 'maxTokens 必须是正数，或留空'
       }
-      return null
+      return effortInvalid(route)
     }
 
-    /** 草稿里数值字段是否可解析；不可解析就阻塞保存而不是悄悄改写用户输入。 */
+    /** 草稿里数值/档位字段是否合法；不合法就阻塞保存而不是悄悄改写用户输入。 */
     function draftInvalid(draft) {
       const threshold = Number(draft.declarationThreshold)
       if (!Number.isInteger(threshold) || threshold < 1) return '「未声明文件阈值」必须是 ≥1 的整数'
       for (const row of ROLE_ROWS) {
-        const maxTokens = draft.routes[row.key].maxTokens.trim()
+        const route = draft.routes[row.key]
+        const maxTokens = route.maxTokens.trim()
         if (maxTokens !== '' && !(Number.isFinite(Number(maxTokens)) && Number(maxTokens) > 0)) {
           return `角色 ${row.label} 的 maxTokens 必须是正数，或留空`
         }
+        const effortProblem = effortInvalid(route)
+        if (effortProblem !== null) return `角色 ${row.label} 的${effortProblem}`
       }
       return null
     }
@@ -299,20 +306,66 @@ window.__ModuleLoader__.load({
      */
     const effortsMemo = {}
     async function fetchEfforts(provider, model) {
+      const key = `${provider}\n${model}`
+      if (Object.hasOwn(effortsMemo, key)) return effortsMemo[key]
+      let found = null
       try {
         const url = `${EFFORTS_URL}?provider=${encodeURIComponent(provider)}&model=${encodeURIComponent(model)}`
         const response = await fetch(url, {
           headers: { accept: 'application/json' },
           credentials: 'same-origin',
         })
-        if (!response.ok) return null
-        const body = await response.json()
-        if (!body || body.ok !== true || body.value === undefined || body.value === null) return null
-        const v = body.value
-        if (!Array.isArray(v.efforts) || v.efforts.length === 0) return null
-        return v
+        if (response.ok) {
+          const body = await response.json()
+          if (body && body.ok === true && body.value !== undefined && body.value !== null) {
+            const v = body.value
+            if (Array.isArray(v.efforts) && v.efforts.length > 0) found = v
+          }
+        }
       } catch (error) {
-        return null
+        found = null
+      }
+      effortsMemo[key] = found
+      return found
+    }
+
+    /** 档位缓存里的已知名单（同步读）；查不到（未查询过或查询失败）回 null = 放行。 */
+    function knownEfforts(provider, model) {
+      const key = `${provider}\n${model}`
+      if (!Object.hasOwn(effortsMemo, key)) return null
+      const found = effortsMemo[key]
+      if (found === null) return null
+      const ids = found.efforts.map((e) => (e === null || typeof e !== 'object' || typeof e.id !== 'string' ? '' : e.id)).filter((id) => id !== '')
+      return ids.length > 0 ? ids : null
+    }
+
+    /**
+     * 推理强度校验：effort 非空、且该 provider/model 的 advertised 名单已知、且不在名单里 → 拦。
+     * 名单查不到（没选模型、查询失败、模型无档位概念）一律放行，不做静态全集兜底拦截。
+     */
+    function effortInvalid(route) {
+      const effort = route.reasoningEffort
+      if (effort === '') return null
+      const provider = route.provider.trim()
+      const model = route.model.trim()
+      if (provider === '' || model === '') return null
+      const known = knownEfforts(provider, model)
+      if (known === null) return null
+      if (known.includes(effort)) return null
+      return `推理强度 ${effort} 不在 ${provider}/${model} 支持的档位里（${known.join(' / ')}）`
+    }
+
+    /**
+     * 保存前把当前草稿用到的 provider/model 档位查齐（带缓存，已查过的直接命中）。
+     * 保存被拦就是「校验发生在保存动作里」的证明。
+     */
+    async function ensureEffortsKnown(routes) {
+      for (const route of routes) {
+        const provider = route.provider.trim()
+        const model = route.model.trim()
+        if (provider === '' || model === '' || route.reasoningEffort === '') continue
+        if (Object.hasOwn(effortsMemo, `${provider}\n${model}`)) continue
+        await fetchEfforts(provider, model)
       }
     }
 
@@ -431,8 +484,8 @@ window.__ModuleLoader__.load({
         }
         let cancelled = false
         void (async () => {
+          // fetchEfforts 自带进程级记忆；这里只为拿它回来渲染。
           const found = await fetchEfforts(selProvider, selModel)
-          effortsMemo[key] = found
           if (!cancelled) setEffortDyn({ key, value: found })
         })()
         return () => {
@@ -455,6 +508,9 @@ window.__ModuleLoader__.load({
 
       const save = async () => {
         if (scope === null || invalid !== null) return
+        // 全量保存前把七个角色的档位查齐（已缓存的直接命中，不额外发请求）再判定。
+        await ensureEffortsKnown(ROLE_ROWS.map((row) => draft.routes[row.key]))
+        if (draftInvalid(draft) !== null) return
         setSaving(true)
         setFailed(null)
         try {
@@ -471,7 +527,10 @@ window.__ModuleLoader__.load({
 
       // 编辑视图的保存：只写当前这一行的四个路由字段，不碰开关与其他角色。
       const saveRole = async (rowKey) => {
-        if (scope === null || roleInvalid(rowKey, draft.routes[rowKey]) !== null) return
+        if (scope === null) return
+        // 保存前查齐档位（缓存命中就不发请求），再判定 —— 选错档位在这里被拦。
+        await ensureEffortsKnown([draft.routes[rowKey]])
+        if (roleInvalid(rowKey, draft.routes[rowKey]) !== null) return
         setSaving(true)
         setFailed(null)
         try {
@@ -655,7 +714,11 @@ window.__ModuleLoader__.load({
         ),
       )
 
-      /** 下拉框的选项（含"继承默认"首项 + 当前值粘滞，目录里没有也不丢）。 */
+      /** 下拉框的选项（含"继承默认"首项；目录里没有的旧值标"失效"警示）。 */
+      const staleTag = '（失效，目录无此项）'
+      const staleKey = 'stale'
+      const staleOf = (value) => ({ value: staleKey, label: `${value}${staleTag}` })
+      const isStale = (value) => value === staleKey
       const providerOptions = (current) => {
         const opts = [{ value: '', label: '继承默认' }]
         if (useCatalog) {
@@ -663,7 +726,7 @@ window.__ModuleLoader__.load({
             opts.push({ value: p.id, label: p.name === p.id ? p.id : `${p.name}（${p.id}）` })
           }
         }
-        if (current !== '' && !opts.some((o) => o.value === current)) opts.push({ value: current, label: `${current}（当前）` })
+        if (current !== '' && !opts.some((o) => o.value === current)) opts.push(staleOf(current))
         return opts
       }
       const modelOptions = (provider, current) => {
@@ -684,13 +747,13 @@ window.__ModuleLoader__.load({
             if (hit !== undefined && Array.isArray(hit.models)) pushAll(hit.models)
           }
         }
-        if (current !== '' && !seen.has(current)) opts.push({ value: current, label: `${current}（当前）` })
+        if (current !== '' && !seen.has(current)) opts.push(staleOf(current))
         return opts
       }
-      /** 推理强度选项：EFFORTS 全集 + 已存旧值粘滞（如下拉里没有 max 但草稿是 max）。 */
+      /** 推理强度选项：EFFORTS 全集 + 目录外旧值标"失效"（如下拉里没有 max 但草稿是 max）。 */
       const effortOptions = (current) => {
         const opts = EFFORTS.map((effort) => ({ value: effort, label: effort === '' ? '（继承）' : effort }))
-        if (current !== '' && !opts.some((o) => o.value === current)) opts.push({ value: current, label: `${current}（当前）` })
+        if (current !== '' && !opts.some((o) => o.value === current)) opts.push(staleOf(current))
         return opts
       }
       /**
@@ -713,7 +776,7 @@ window.__ModuleLoader__.load({
               : (e.name && e.name !== e.id ? `${e.name}（${e.id}）` : e.id)
             options.push({ value: e.id, label })
           }
-          if (current !== '' && !seen.has(current)) options.push({ value: current, label: `${current}（当前）` })
+          if (current !== '' && !seen.has(current)) options.push(staleOf(current))
         }
         return h(
           'div',
@@ -760,7 +823,13 @@ window.__ModuleLoader__.load({
           ]
         }
         return [
-          selectField('供应商', route.provider, providerOptions(route.provider), (v) => edit((next) => { next.routes[rowKey].provider = v })),
+          selectField('供应商', route.provider, providerOptions(route.provider), (v) => edit((next) => {
+            // 供应商一切换，旧模型必然是幽灵组合（大小写错位如 kimi-k3 vs KIMI-K3）——
+            // 直接清空逼重选，不给误导活路。这是"（当前）粘滞误导"事故的源头修复。
+            next.routes[rowKey].provider = v
+            next.routes[rowKey].model = ''
+            next.routes[rowKey].reasoningEffort = ''
+          })),
           selectField('模型', route.model, modelOptions(route.provider, route.model), (v) => edit((next) => { next.routes[rowKey].model = v })),
         ]
       }

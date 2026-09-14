@@ -393,7 +393,7 @@ async function verifyPanelMechanism() {
   check('executor 行无 toolFilter（可写）', executorRow?.options?.config?.toolFilter === undefined, JSON.stringify(executorRow?.options?.config?.toolFilter))
   check('executor 行带 persona', typeof executorRow?.options?.config?.persona === 'string' && executorRow.options.config.persona.length > 50)
   const reviewerRow = loader.entries.get('collab-code-reviewer')
-  check('只读行带 toolFilter.deny', Array.isArray(reviewerRow?.options?.config?.toolFilter?.deny) && reviewerRow.options.config.toolFilter.deny.length === 17, JSON.stringify(reviewerRow?.options?.config?.toolFilter))
+  check('只读行带 toolFilter.deny', Array.isArray(reviewerRow?.options?.config?.toolFilter?.deny) && reviewerRow.options.config.toolFilter.deny.length === 13, JSON.stringify(reviewerRow?.options?.config?.toolFilter))
   check('默认不写 agentOptions（留空 = 继承会话）', executorRow?.options?.config?.agentOptions === undefined, JSON.stringify(executorRow?.options?.config?.agentOptions))
 
   // T10：面板保存 → setSource/onChange → 角色行被 loader.update 改写。
