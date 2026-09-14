@@ -46,8 +46,18 @@ function readContent(rel) {
  * 只读角色要从子智能体工具集里摘掉的写操作工具名。
  *
  * ⚠ 这些名字必须真实存在：`@deepseek-ai/dsh-tools` 的 `restrict()` 遇到未知工具名
- * 会直接抛错，子智能体就起不来。名单按本机 DSH 0.1.5-rc.1（web profile）实测的
- * 可见工具集确定，不含 Windows 上被 disabled 的 `bash`。
+ * 会直接抛错，子智能体就起不来。名单按本机 web preset 实测的已知工具表确定
+ * （`standard` preset 注册的模型可见工具行），不含 Windows 上被 disabled 的 `bash`。
+ *
+ * ⚠ 2026-09-14：删掉 `cordis_define` / `cordis_run` / `cordis_stop` / `cordis_undefine`
+ * 四个名字（17 → 13）。它们只由 `@deepseek-ai/dsh-tool-cordis` 提供，而那个包只出现在
+ * `presets/cordis/agent.cordis.yml`，默认的 `standard` preset 里没有 —— 名字不可解析会让
+ * `restrict()` 整体抛错，7 个角色一个都派不出去。剩下这 13 个在 standard preset 的已知
+ * 工具表里全部存在。残余风险：将来某个 DSH 版本把这 4 个恢复进默认 preset，本名单就会
+ * 少拦 4 个写操作工具 —— 由「7 角色活体点名」当探测器（委派会响亮地失败），见 README。
+ *
+ * ⚠ Z-Code 侧不用这份名单（它是 DSH `tools.restrict()` 的机制，不属于两平台共用内容），
+ * 所以本改动对 Z-Code 零影响。
  *
  * ⚠ `subagent` 刻意不在名单里：本机预设把那一行配成 `modelSelectionSettings: true`，
  * 该工具会被注册进**每个 agent 自己的层**，而 `restrict()` 只认继承来的名字、
@@ -64,10 +74,6 @@ const MUTATING_TOOLS = [
   'job_kill',
   'create_goal',
   'update_goal',
-  'cordis_define',
-  'cordis_run',
-  'cordis_stop',
-  'cordis_undefine',
   'exit_plan_mode',
   'send_message',
   'interrupt_agent',

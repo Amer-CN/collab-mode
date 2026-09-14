@@ -332,6 +332,201 @@ function targetOf(exec) {
   return ''
 }
 
+/* ──────────────────── 7. opencode free 回传剥除 ──────────────────── *
+ *
+ * 背景：DSH 走 zen 渠道（openai-responses 协议）的 free 模型在多轮 agent 会话里
+ * 报 `reasoning encrypted_content was not issued to this caller`。
+ * 机制（2026-09-14 实验矩阵）：pi-ai 发推理档位必带
+ * `include:["reasoning.encrypted_content"]`，响应里的加密推理块经 replay 状态在下一轮
+ * 原样回传；上游对回传的加密内容做 caller 校验，且**校验不认 `x-opencode-session` 头的值**
+ * （T3：新 UUID 回传旧加密内容仍 200）—— 真正的坑就是「回传了加密内容」本身，上游重排
+ * 路由/池子时必炸。短会话测不出，长 agent 会话必现。
+ *
+ * 修法（两个动作，都装在宿主进程 `globalThis.fetch` 的窄包装里）：
+ *   A（主修法）**剥除加密回传**：只打 free 端点（路径含 `/zen/v1/`）的 POST JSON 请求，
+ *     从 `input` 数组剔除所有 `type === "reasoning"` 的项再转发；付费 `/zen/go/v1` 一个
+ *     字节都不碰，保留完整推理连续性。上游接受剥除后的历史（实验 D2），模型从可见历史
+ *     重新推理。
+ *   B（辅修法）**会话头镜像**：host 含 opencode.ai（含付费 go 端点，语义与 ZCode 一致、
+ *     无害）时，把 pi-ai 每请求自带的 `x-client-request-id`（= DSH 会话 id）覆盖写进
+ *     `x-opencode-session`；没有该头的请求（如模型目录发现）用进程级懒生成一次的 UUID v4。
+ *     目的：符合上游文档契约、路由粘性、prompt 缓存，并终结 settings 里那个写死数月的共享 UUID。
+ *
+ * 为什么拦得住（实现前已实证，行号见汇报）：
+ * - pi-ai `openai-responses.js` 第 112 行 `createClient(...)` 把 `options?.fetch`（DSH 从不传，
+ *   `dsh-llm-pi-ai` 第 1867–1874 行只给 headers/sessionId/signal 等）交给第 201–207 行
+ *   `new OpenAI({ fetch, defaultHeaders })`；OpenAI SDK `client.js` 第 160 行
+ *   `this.fetch = options.fetch ?? Shims.getDefaultFetch()`，而 `shims.js` 第 9–14 行的
+ *   `getDefaultFetch()` 返回裸 `fetch` 标识符 = 构造那一刻的 `globalThis.fetch`。
+ *   pi-ai 每请求新建 client，包装在插件 apply（进程启动）时已装好，故每次都落在包装里
+ *   （实测 `client.fetch === globalThis.fetch`，出站 1 次调用被包装捕获）。
+ * - SDK 出站走 `client.js` 第 510 行 `this.fetch.call(undefined, url, fetchOptions)`：
+ *   `url` 是字符串、`body` 是 JSON 字符串、**不设 content-length**，故改写 body 无残留长度问题。
+ * - profile 静态头经 `requestHeaders()`（`dsh-llm-pi-ai` 第 1723–1730 行）合并进 SDK
+ *   `defaultHeaders`（`client.js` 第 624 行），我们在 fetch 层最后改写，天然后发先至，稳赢静态旧值。
+ *
+ * 幂等与还原：重复安装不叠层（返回同一个 unwrap）；`ctx.effect` 注册的 dispose 完整还原原 fetch。
+ * fail-open：非 opencode.ai 域零接触（连 body 都不 parse）；解析失败/不命中一律原样透传，绝不报错。
+ */
+
+/** 命中的域名：opencode.ai 本域及子域（点边界，避免 evilopencode.ai 这类擦边）。 */
+const OPENCODE_HOST_SUFFIX = 'opencode.ai'
+const OPENCODE_SESSION_HEADER = 'x-opencode-session'
+const CLIENT_REQUEST_ID_HEADER = 'x-client-request-id'
+/** free 端点路径标记：付费 `/zen/go/v1/` 不含它，天然被排除在动作 A 之外。 */
+const OPENCODE_FREE_PATH_MARK = '/zen/v1/'
+
+let opencodeOriginalFetch = null
+let opencodeWrappedFetch = null
+let opencodeProcessSessionId = null
+
+/** 进程级懒生成一次的 UUID v4（无会话 id 可用时的兜底身份）。 */
+function opencodeProcessSession() {
+  if (opencodeProcessSessionId === null) opencodeProcessSessionId = randomUUID()
+  return opencodeProcessSessionId
+}
+
+/** 动作 B 用：合并出站头（Request 自带头 + init 头，init 赢），再镜像出会话头。 */
+function opencodeWrapHeaders(input, init) {
+  const headers = new Headers()
+  try {
+    if (typeof Request === 'function' && input instanceof Request) {
+      input.headers.forEach((value, key) => headers.set(key, value))
+    }
+  } catch {
+    // 读不到就当没有，绝不让头部处理炸掉真实请求。
+  }
+  try {
+    new Headers(init?.headers).forEach((value, key) => headers.set(key, value))
+  } catch {
+    // 同上。
+  }
+  const clientId = headers.get(CLIENT_REQUEST_ID_HEADER)
+  headers.set(OPENCODE_SESSION_HEADER, clientId !== null && clientId !== '' ? clientId : opencodeProcessSession())
+  return headers
+}
+
+/**
+ * 动作 A 用：从请求体 JSON 的 `input` 数组里剔除所有 `type === "reasoning"` 的项。
+ * 返回重新序列化的 body；不命中（非法 JSON / 无 input 数组 / 本就没有 reasoning 项）返回 null，
+ * 调用方据此原样透传——绝不为「无事可做」而改写字节。
+ */
+function stripReasoningReplay(rawBody) {
+  if (typeof rawBody !== 'string' || rawBody === '') return null
+  let parsed
+  try {
+    parsed = JSON.parse(rawBody)
+  } catch {
+    return null
+  }
+  if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.input)) return null
+  const kept = parsed.input.filter((item) => !(item !== null && typeof item === 'object' && item.type === 'reasoning'))
+  if (kept.length === parsed.input.length) return null
+  parsed.input = kept
+  try {
+    return JSON.stringify(parsed)
+  } catch {
+    return null
+  }
+}
+
+/** 当前是否装着包装（自检字段与夹具都读它）。 */
+export function opencodeFreeRelayInstalled() {
+  return opencodeOriginalFetch !== null
+}
+
+export function uninstallOpencodeFreeRelay() {
+  // 只拆自己的：若之后又叠了别人的包装，不替别人拆。
+  if (opencodeOriginalFetch !== null && globalThis.fetch === opencodeWrappedFetch) {
+    globalThis.fetch = opencodeOriginalFetch
+  }
+  opencodeOriginalFetch = null
+  opencodeWrappedFetch = null
+}
+
+/** 从 input/init 里取 URL 字符串（取不到即 ''，交给调用方透传）。 */
+function opencodeUrlOf(input) {
+  try {
+    if (typeof input === 'string') return input
+    if (input instanceof URL) return input.href
+    if (typeof Request === 'function' && input instanceof Request) return input.url
+    if (input !== null && typeof input === 'object' && typeof input.url === 'string') return input.url
+  } catch {
+    // 形状异常一律当没有 URL。
+  }
+  return ''
+}
+
+/**
+ * 安装全局 fetch 窄包装（动作 A 剥除加密回传 + 动作 B 会话头镜像），返回 unwrap。
+ * 幂等：重复安装不叠层，直接返回同一个 unwrap。
+ * 非 opencode.ai 域零接触；URL 解析失败、非法 JSON body、input 形状异常一律原样透传，绝不炸请求。
+ */
+export function installOpencodeFreeRelay() {
+  if (opencodeOriginalFetch !== null) return uninstallOpencodeFreeRelay
+  const original = globalThis.fetch
+  if (typeof original !== 'function') return () => {}
+  const wrapped = async function opencodeFreeRelayFetch(input, init) {
+    let host = ''
+    let path = ''
+    try {
+      const url = opencodeUrlOf(input)
+      if (url !== '') {
+        const parsed = new URL(url)
+        host = parsed.hostname.toLowerCase()
+        path = parsed.pathname
+      }
+    } catch {
+      host = ''
+    }
+    // 非 opencode.ai 域：零接触（不碰 header，也不 parse body）。
+    if (host === '' || (host !== OPENCODE_HOST_SUFFIX && !host.endsWith('.' + OPENCODE_HOST_SUFFIX))) {
+      return original.call(this, input, init)
+    }
+
+    const headers = opencodeWrapHeaders(input, init)
+
+    // 动作 A 命中条件：POST + 路径含 `/zen/v1/`（付费 `/zen/go/v1/` 不含该标记，天然排除）
+    // + Content-Type json。任一不满足就只做动作 B。
+    const isRequest = typeof Request === 'function' && input instanceof Request
+    const method = String(init?.method ?? (isRequest ? input.method : 'GET')).toUpperCase()
+    const contentType = String(headers.get('content-type') ?? '').toLowerCase()
+    const wantsStrip = method === 'POST' && path.includes(OPENCODE_FREE_PATH_MARK) && contentType.includes('json')
+
+    if (wantsStrip) {
+      try {
+        // 真实路径（OpenAI SDK）：URL 是字符串、body 是 JSON 字符串。
+        if (typeof init?.body === 'string') {
+          const stripped = stripReasoningReplay(init.body)
+          if (stripped !== null) return original.call(this, input, { ...init, headers, body: stripped })
+        } else if (isRequest) {
+          // Request 形态：clone 读体不消耗原件，读不到就退回原请求。
+          const stripped = stripReasoningReplay(await input.clone().text())
+          if (stripped !== null) return original.call(this, new Request(input, { headers, body: stripped }), undefined)
+        }
+      } catch {
+        // 改写失败就原样透传（不断请求）。
+      }
+    }
+
+    try {
+      if (typeof input === 'string' || input instanceof URL) {
+        return original.call(this, input, { ...init, headers })
+      }
+      if (isRequest) {
+        return original.call(this, new Request(input, { ...init, headers }), undefined)
+      }
+    } catch {
+      // 重建失败就原样透传（不断请求）。
+    }
+    return original.call(this, input, init)
+  }
+  opencodeOriginalFetch = original
+  opencodeWrappedFetch = wrapped
+  globalThis.fetch = wrapped
+  return uninstallOpencodeFreeRelay
+}
+
 /* ────────────────────────── 插件本体 ────────────────────────── */
 
 /**
@@ -597,6 +792,143 @@ export function apply(ctx, rawConfig) {
 
   /* ---- 6. 自检桥（面板 C 区块的数据源） ---- */
 
+  /* ---- 6b. 面板展示用的只读元数据（ZCode 子智能体页同款：描述/颜色/工具） ----
+   *
+   * 来源是仓库 `content/manifest.json` 的 zcode 块 —— 与 ZCode 生成器、ZCode 部署
+   * 读的是同一份源，不是手写第二份。读不到就回退空值，面板隐藏对应展示、不报错。
+   */
+  let manifestRoles = null
+  let manifestLoaded = false
+  function roleMeta(key) {
+    if (!manifestLoaded) {
+      manifestLoaded = true
+      try {
+        const manifest = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'content', 'manifest.json'), 'utf8'))
+        manifestRoles = Array.isArray(manifest?.roles) ? manifest.roles : null
+      } catch {
+        manifestRoles = null
+      }
+    }
+    if (manifestRoles === null) return null
+    const direct = manifestRoles.find((r) => r?.key === key)
+    if (direct !== undefined) return direct?.zcode ?? null
+    // advisor-A/B/C 三席共用 advisor 一条。
+    const base = key.replace(/-[ABC]$/, '')
+    return manifestRoles.find((r) => r?.key === base)?.zcode ?? null
+  }
+
+  /* ---- 6c. 可用模型目录（编辑页"模型"下拉的数据源，只读） ----
+   *
+   * 读 `llm` 服务的注册供应商 + 各自广告的模型（与 `list_subagent_models` 同一来源，
+   * 但不过会话 policy 过滤：面板要的是全目录）。60 秒缓存；任何一步失败就整体
+   * 回退 null，面板降级用单级下拉/文本输入，绝不让自检变红。
+   */
+  let catalogCache = { at: 0, llm: null, value: null }
+  async function modelCatalog(serverCtx) {
+    const now = Date.now()
+    // llm 服务引用先解析：缓存按引用键化，不同引用（夹具里的桩）互不污染。
+    let llm
+    try {
+      llm = serverCtx !== null && typeof serverCtx === 'object' && typeof serverCtx.get === 'function'
+        ? serverCtx.get('llm')
+        : undefined
+    } catch {
+      llm = undefined
+    }
+    const key = llm ?? null
+    if (now - catalogCache.at < 60000 && catalogCache.llm === key) return catalogCache.value
+    let value = null
+    try {
+      if (llm !== undefined && llm !== null && typeof llm.listProviders === 'function') {
+        const providers = llm.listProviders()
+        if (Array.isArray(providers) && providers.length > 0) {
+          const rows = []
+          for (const p of providers) {
+            if (p === null || typeof p !== 'object' || typeof p.id !== 'string' || p.id === '') continue
+            let models = []
+            try {
+              const listed = await llm.listModels(p.id)
+              if (Array.isArray(listed)) {
+                models = listed
+                  .filter((m) => m !== null && typeof m === 'object' && typeof m.id === 'string' && m.id !== '')
+                  .map((m) => ({ id: m.id, name: typeof m.name === 'string' && m.name !== '' ? m.name : m.id }))
+              }
+            } catch {
+              models = []
+            }
+            rows.push({ id: p.id, name: typeof p.name === 'string' && p.name !== '' ? p.name : p.id, models })
+          }
+          if (rows.length > 0) value = { providers: rows }
+        }
+      }
+    } catch {
+      value = null
+    }
+    catalogCache = { at: now, llm: key, value }
+    return value
+  }
+
+  /* ---- 6d. 模型档位目录（编辑页"推理强度"下拉的数据源，只读） ----
+   *
+   * 调 `llm.resolveModelInfo(provider, model)` 拿该模型的 advertised 档位——
+   * 对话窗口的模型下拉就是这么渲染的（见 dsh-tool-subagent 的 list_subagent_models，
+   * 读 `model.reasoning.efforts[]` + `defaultEffort`）。
+   * 单条缓存 60 秒（按 llm 引用 + provider/model 键化）；查不到或模型无档位概念
+   * 就回 null，面板回退静态全集，绝不让路由变红。
+   */
+  let effortsCache = { at: 0, llm: null, key: '', value: null }
+  async function modelEfforts(serverCtx, provider, model) {
+    if (typeof provider !== 'string' || provider === '' || typeof model !== 'string' || model === '') return null
+    let llm
+    try {
+      llm = serverCtx !== null && typeof serverCtx === 'object' && typeof serverCtx.get === 'function'
+        ? serverCtx.get('llm')
+        : undefined
+    } catch {
+      llm = undefined
+    }
+    const ref = llm ?? null
+    const key = `${provider}\n${model}`
+    const now = Date.now()
+    if (now - effortsCache.at < 60000 && effortsCache.llm === ref && effortsCache.key === key) return effortsCache.value
+    let value = null
+    try {
+      if (llm !== undefined && llm !== null && typeof llm.resolveModelInfo === 'function') {
+        const info = await llm.resolveModelInfo(provider, model)
+        const reasoning = info !== null && typeof info === 'object' ? info.reasoning : undefined
+        const listed = reasoning !== null && typeof reasoning === 'object' && Array.isArray(reasoning.efforts)
+          ? reasoning.efforts
+          : []
+        const rows = []
+        for (const e of listed) {
+          if (e === null || typeof e !== 'object' || typeof e.id !== 'string' || e.id === '') continue
+          rows.push({ id: e.id, name: typeof e.name === 'string' && e.name !== '' ? e.name : e.id })
+        }
+        if (rows.length > 0) {
+          const def = reasoning !== null && typeof reasoning === 'object' && typeof reasoning.defaultEffort === 'string'
+            ? reasoning.defaultEffort
+            : ''
+          value = { provider, model, efforts: rows, defaultEffort: rows.some((r) => r.id === def) ? def : '' }
+        }
+      }
+    } catch {
+      value = null
+    }
+    effortsCache = { at: now, llm: ref, key, value }
+    return value
+  }
+
+  /** 从 exact 路由的 req.url 里取 query 参数（取不到即 ''）。 */
+  function queryParam(req, name) {
+    try {
+      const url = req !== null && typeof req === 'object' && typeof req.url === 'string' ? req.url : ''
+      if (url === '') return ''
+      return new URL(url, 'http://localhost').searchParams.get(name) ?? ''
+    } catch {
+      return ''
+    }
+  }
+
   /** 七个角色工具**实际**注册在哪、各自实际解析到的路由。 */
   function inspectRoles() {
     const loader = ctx.get('loader')
@@ -606,6 +938,9 @@ export function apply(ctx, rawConfig) {
       const entry = loader === undefined ? undefined : resolveEntry(loader, id)
       const config = entry?.options?.config
       const agentOptions = config?.agentOptions
+      // 面板列表/编辑页的只读展示字段（描述/色标/工具/人设全文均只读，不可编辑）。
+      const meta = roleMeta(role.key)
+      const denyList = Array.isArray(config?.toolFilter?.deny) ? [...config.toolFilter.deny] : []
       rows.push({
         key: role.key,
         tool: role.tool,
@@ -620,8 +955,13 @@ export function apply(ctx, rawConfig) {
         model: agentOptions?.model ?? '',
         reasoningEffort: agentOptions?.reasoningEffort ?? '',
         maxTokens: agentOptions?.maxTokens ?? 0,
-        deniedTools: Array.isArray(config?.toolFilter?.deny) ? config.toolFilter.deny.length : 0,
+        deniedTools: denyList.length,
+        denied: denyList,
         personaChars: typeof config?.persona === 'string' ? config.persona.length : 0,
+        persona: typeof config?.persona === 'string' ? config.persona : '',
+        description: typeof meta?.description === 'string' ? meta.description : '',
+        color: typeof meta?.color === 'string' ? meta.color : '',
+        tools: Array.isArray(meta?.tools) ? [...meta.tools] : [],
       })
     }
     return rows
@@ -683,6 +1023,8 @@ export function apply(ctx, rawConfig) {
       },
       roles: inspectRoles(),
       lastAudit: lastAudit(),
+      // 第 7 节探针：面板 C 区块不动 UI，JSON 里可见即可。
+      opencodeFreeRelay: opencodeFreeRelayInstalled(),
     }
   }
 
@@ -720,11 +1062,11 @@ export function apply(ctx, rawConfig) {
       return true
     }
     serverCtx.effect(
-      () =>
-        serverCtx.webServer.register({
+      () => {
+        const offSelfcheck = serverCtx.webServer.register({
           kind: 'exact',
           path: `/api/${NS}/selfcheck`,
-          handler: (req, res) => {
+          handler: async (req, res) => {
             if (rejected(req, res)) return
             if (req.method !== 'GET') {
               res.statusCode = 405
@@ -733,13 +1075,63 @@ export function apply(ctx, rawConfig) {
               return
             }
             try {
-              sendJson(res, 200, { ok: true, value: selfCheck() })
+              const value = selfCheck()
+              // 模型目录是 best-effort：拿不到就 null，面板降级，绝不 500。
+              try {
+                value.modelCatalog = await modelCatalog(serverCtx)
+              } catch {
+                value.modelCatalog = null
+              }
+              sendJson(res, 200, { ok: true, value })
             } catch (error) {
               sendJson(res, 500, { ok: false, code: 'selfcheck-failed', message: String(error && error.message) })
             }
           },
-        }),
+        })
+        const offEfforts = serverCtx.webServer.register({
+          kind: 'exact',
+          path: `/api/${NS}/model-efforts`,
+          handler: async (req, res) => {
+            if (rejected(req, res)) return
+            if (req.method !== 'GET') {
+              res.statusCode = 405
+              res.setHeader('allow', 'GET')
+              res.end()
+              return
+            }
+            const provider = queryParam(req, 'provider')
+            const model = queryParam(req, 'model')
+            if (provider === '' || model === '') {
+              sendJson(res, 400, { ok: false, code: 'bad-request', message: 'query provider and model are required' })
+              return
+            }
+            try {
+              // 查不到就 efforts null：面板回退静态全集，绝不 500。
+              const found = await modelEfforts(serverCtx, provider, model)
+              sendJson(res, 200, {
+                ok: true,
+                value: found === null
+                  ? { provider, model, efforts: null, defaultEffort: '' }
+                  : found,
+              })
+            } catch (error) {
+              sendJson(res, 500, { ok: false, code: 'efforts-failed', message: String(error && error.message) })
+            }
+          },
+        })
+        return () => {
+          offSelfcheck()
+          offEfforts()
+        }
+      },
       'collab-mode: self-check route',
     )
   })
+
+  // ---- 7. opencode free 回传剥除：装全局 fetch 窄包装（仅 opencode.ai 域）----
+  installOpencodeFreeRelay()
+  // fiber 停止时拆掉（HMR/重载不留残留）；夹具 ctx 没有 effect，守卫跳过。
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => () => uninstallOpencodeFreeRelay())
+  }
 }

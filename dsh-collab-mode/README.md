@@ -22,7 +22,7 @@ DeepSeek Harness 插件：把 ZCode 侧那套「协作模式」搬到 DSH 上。
 | 2 | 协作纪律系统提示段 | `ctx.systemPrompt.section` |
 | 3 | 改动前拦截 + 工具调用审计 | `tools/pre-execute` / `tools/post-execute` |
 | 4 | 轮次结束告警 | `agent/turn-stopping` |
-| 5 | 设置面板（v0.2.0） | settings 命名空间 `collab-mode` + 客户端卡片 `settings.plugin.item` |
+| 5 | 设置面板（v0.2.0） | settings 命名空间 `collab-mode` + `settings.section` 独立导航（id collab-mode，order 79，使用统计上方） |
 
 钩子走 DSH 的**代码级事件**，不依赖 `@deepseek-ai/dsh-hooks-claude-code` 适配器，也不复用 ZCode 的 PowerShell 脚本。
 
@@ -48,15 +48,21 @@ dsh plugin --profile web add link:<克隆到的父目录>/collab-mode/dsh-collab
 dsh plugin --profile web remove dsh-collab-mode
 ```
 
-## 设置面板（v0.2.0）
+## 设置面板（v0.2.0 建，v0.4.0 改为 ZCode 子智能体页同款两视图）
 
-「设置 → 插件 → 插件配置」里的**协作模式**卡片，排在 Free Search 之后，四个区块：
+设置左侧导航里的「协作模式」栏（紧贴「使用统计」上方）。页内分列表 / 编辑两视图，
+外观照抄 ZCode `Settings → Subagents`，语义按 DSH（用户决策：外观复刻、语义适配——
+新建/删除/启用开关/persona 可编辑/工具勾选一律不做）：
+
+| 视图 | 内容 | 落点 |
+|---|---|---|
+| 列表 | 7 行（色点 + 名称 + 模型 chip + 工具计数 + 描述，一行截断）＋搜索框，点行进编辑；行上无可写/只读 tag，未注册才红字提示；B/C/D 原样排在列表下方 | 自检 roles[] 的描述/颜色/路由/工具清单（只读展示） |
+| 编辑 | 面包屑（协作模式 ＞ 角色名）＋名称（只读）/颜色标记（只读）/供应商→模型两级下拉/推理强度（跟随选中模型的 advertised 档位，默认档有标记；未选模型或查不到时回退静态全集 off…xhigh）/maxTokens/描述（只读）/可用工具（只读）/系统提示词（只读）＋保存/放弃/返回列表 | 下拉选项来自自检 `modelCatalog`（`llm` 服务全目录）与只读路由 `GET /api/collab-mode/model-efforts`；拿不到就降级，绝不白屏 |
 
 | 区块 | 内容 | 落点 |
 |---|---|---|
-| A 角色路由 | 七行 × 供应商 / 模型 / 推理强度 / maxTokens，**留空 = 继承当前会话模型**（advisor 三席各配一个厂商） | settings 命名空间 `collab-mode` |
-| B 纪律开关 | `gate` / `audit` / `warnOnTurnEnd` + 未声明文件阈值 + 审计目录 | 同上；`cordis.patch.yml` 里的值降级为默认值 |
-| C 自检 | 插件版本、提示段字符数、七个角色工具**是否已注册**、各自**实际生效路由**、审计目录、最近一条审计记录、刷新与探测按钮 | 宿主只读路由 `GET /api/collab-mode/selfcheck` |
+| B 纪律开关 | `gate` / `audit` / `warnOnTurnEnd` + 未声明文件阈值 + 审计目录 | settings 命名空间 `collab-mode` |
+| C 自检 | 插件版本、提示段字符数、七个角色工具**是否已注册**、各自**实际生效路由**、审计目录、最近一条审计记录、刷新与探测按钮 | 宿主只读路由 `GET /api/collab-mode/selfcheck`（另带 `modelCatalog`，best-effort，失败回 null） |
 | D 角色定义 | 每行的 loader 行 id / 是否运行 / toolFilter 条数 / persona 字符数（只读） | 同一自检路由 |
 
 A/B 的读写走**原生 client settings scope**（`ctx.settingsScope.bind`），不经过自建 HTTP bridge；`unset` 用于「留空」，因此清空字段是退回组合层默认值，而不是写一个空串进用户层。
@@ -73,13 +79,10 @@ Cordis 的 `ctx.get(name)` **不参与依赖等待**：`ServiceRegistry.notify` 
 `undefined`，卡片会**永久锁死在降级态** —— v0.2.0 的面板不可编辑（A/B 区块全灰 +
 红色降级提示）就是这个原因，v0.2.1 修掉。
 
-**代价与取舍**：硬依赖意味着 `settingsScope` 缺席时**整个客户端插件不加载**、卡片不出现，
-失去「服务未就绪」那一档的可读降级文案。这个损失经核实是空的：
+**代价与取舍**：硬依赖意味着 `settingsScope` 缺席时**整个客户端插件不加载**、面板不出现。
+保留 settingsScope 硬依赖，因为 scope.bind 仍需要它：
 
-- `settings.plugin.item` 插槽本身由 `dsh-client-ui-settings-plugins` 的
-  `ConfigurablePluginsTab` 声明，而它的 `inject` 也含 `settingsScope` ——
-  服务缺席时插槽根本不存在，卡片本来也无处注册。
-- **命名空间级**降级（宿主未服务该 ns、memory 模式不可写）**不受影响**，仍由卡片内
+- 命名空间级降级（宿主未服务该 ns、memory 模式不可写）**不受影响**，仍由卡片内
   `status !== 'ready'` 分支给出可读原因。
 
 夹具对这条有专门的回归断言（`.work/verify-plugin.mjs` 的 T13），且已验证「把
@@ -268,8 +271,35 @@ ZCode skill 侧另有一份**手写搬运**的副本。手工同步两份文本�
 `collab-mode` 一行 —— 角色行的存在性要看自检区（C 区块）或
 `GET /api/collab-mode/selfcheck` 的 `roles[].entryPresent / active`。
 
+## opencode free 端点回传剥除（v0.5.0）
+
+DSH 走 zen 渠道（openai-responses 协议）的 free 模型，在多轮 agent 会话里报
+`reasoning encrypted_content was not issued to this caller`。已实锤的机制：pi-ai 发推理档位
+必带 `include:["reasoning.encrypted_content"]`，响应里的加密推理块经 replay 状态在下一轮
+原样回传，而上游对回传的加密内容做 caller 校验 —— 真正的坑就是「回传了加密内容」本身
+（实测：换新 UUID 回传旧加密内容仍 200，说明上游不认 `x-opencode-session` 的值），
+上游重排路由/池子时必炸。短会话测不出，长 agent 会话必现。
+
+修法：插件给宿主进程的 `globalThis.fetch` 装窄包装，两个动作，**仅 opencode.ai 域**：
+
+- **动作 A（主修法）剥除加密回传**：只打 free 端点（POST + 路径含 `/zen/v1/` + JSON body），
+  从 `input` 数组剔除所有 `type === "reasoning"` 的项再转发（上游接受剥除后的历史，回答正确）。
+- **动作 B（辅修法）会话头镜像**：把 pi-ai 每次请求自带的 `x-client-request-id`（= DSH 会话 id）
+  覆盖写进 `x-opencode-session`（覆盖 profile 里写死的静态旧值正是目的）；没有该头的请求
+  （如模型目录发现）用进程级懒生成一次的 UUID v4。付费 `go` 端点同样镜像（语义与 ZCode 一致、无害）。
+
+其他域名零接触（连 body 都不 parse）。fiber 停止时自动拆掉，重复安装不叠层；
+解析失败/不命中一律原样透传（fail-open），绝不报错。
+自检 JSON 带 `opencodeFreeRelay: true/false`（C 区块不加 UI）。
+
 ## 已知边界
 
+- **free 端点跨轮推理连续性被剥除**：动作 A 剔掉回传的加密推理块，模型从**可见历史**重新推理，
+  拿不到上一轮的原生推理链。这是修 caller 校验崩溃的代价，只影响 free 端点（`/zen/v1/`）；
+  付费 go 通道（`/zen/go/v1/`）body 逐字节不动，推理连续性完整保留。
+  若上游未来对剥除后的请求改变行为（例如拒绝缺 reasoning 项的历史），**回退 = 卸载包装**：
+  删掉 `apply()` 末尾的 `installOpencodeFreeRelay()` 调用（或让 `ctx.effect` 的 dispose 跑一次），
+  fetch 即还原为原实现，无需改其他文件。
 - **只读名单依赖工具名**：`toolFilter.deny` 里的名字必须真实存在，见上文。
 - **`subagent` 无法被只读过滤器摘掉**：本机预设把 `tool-subagent` 那行配成 `modelSelectionSettings: true`，该工具会注册进**每个 agent 自己的层**；而 `@deepseek-ai/dsh-tools` 的 `restrict()` 只认继承来的名字（global + 祖先层），明确拒绝 scope-local 名字。实测把它放进 `deny` 会让每次委派都抛 `tools.restrict() names unknown global tool "subagent"`。
   影响面：只读角色**自己**确实没有写工具（实测子智能体列出的工具集里没有 `write`/`edit`/`pwsh`），但它若主动去用预设那个 `subagent` 工具往下再派一层，**孙代不会继承这里的 `toolFilter`**（`dsh-subagent` 的委派只延续 sandbox/approval 两项策略，不延续 persona/toolFilter），那一层就不受只读约束了。`maxDepth: 1` 只管住本插件这七个工具自身的递归深度。
@@ -277,6 +307,7 @@ ZCode skill 侧另有一份**手写搬运**的副本。手工同步两份文本�
 - **状态是进程内的**：`seen` / `changed` 按 sessionId 存在内存里，进程重启或会话恢复后从空开始（与 `@deepseek-ai/dsh-repeat-tool-reminder` 的取舍一致）。审计日志是落盘的，可追。
 - **改代码后无法在运行中的进程里热更新**：cordis 的 HMR（`root: []`）只监听补丁文件，不监听模块文件，且 loader 复用已解析包的 ESM 模块缓存。改完插件代码要重启 `dsh web` 才生效。
 - **不含 `/roundtable` 命令**：任务书第 4 项标为「建议，可选」，本次未实现。多方意见靠同时调用 `advisor-A` / `advisor-B` / `advisor-C` 实现，规则文本已如此描述。
+- **opencode free 端点修复只保证「不回传加密内容」+「每会话稳定身份」**：上游账号池重排/限流导致的偶发失败若仍出现，下一步在出口侧做请求级粘性，不在本插件（fetch 包装只管剥回传与定身份，不管重试与路由）。
 - **不修改任何出厂预设**：插件走 profile bundle 层（Host 平面），与 agent preset 无关。
 
 ## 版本

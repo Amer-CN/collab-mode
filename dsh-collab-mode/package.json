@@ -1,6 +1,6 @@
 {
   "name": "dsh-collab-mode",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "DeepSeek Harness 插件：协作模式 —— 七个角色子智能体工具（executor / code-reviewer / researcher / advisor-A / advisor-B / advisor-C / vision-reader）+ 协作纪律系统提示段 + 改动前拦截、工具调用审计、轮次结束告警三个代码级钩子 + 设置面板（按角色选模型/推理强度 + 运行时自检）。",
   "type": "module",
   "main": "lib/index.js",

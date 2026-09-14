@@ -32,6 +32,9 @@ try {
   throw error
 }
 
+// 第 7 节导出的修复函数（与 apply 同一模块实例，标记位共享）。
+const { installOpencodeFreeRelay, uninstallOpencodeFreeRelay, opencodeFreeRelayInstalled } = await import('../lib/index.js')
+
 let passed = 0
 const failures = []
 
@@ -160,7 +163,9 @@ function makeCtx(services = {}) {
           else available[name] = services[name]
         }
         if (ready) {
-          const injectedCtx = { ...available, effect: (fn) => fn(), settings: available.settings, webServer: available.webServer }
+          // 注入面同时带 get：宿主代码在请求时用 serverCtx.get('llm') 读模型目录，
+          // 与真实 Cordis 注入面一致；缺席时返回 undefined，插件必须降级而非抛错。
+          const injectedCtx = { ...available, effect: (fn) => fn(), settings: available.settings, webServer: available.webServer, get: (name) => services[name] }
           // cordis 注入面同时是 ctx 属性：声明 inject 的服务按属性访问（官方 open-in-app 亦如此）。
           if (available.connection !== undefined) injectedCtx.connection = available.connection
           callback(injectedCtx)
@@ -502,10 +507,11 @@ async function verifyPanelMechanism() {
   }
 
   // 栅栏返回 401 → 必须 401，且不泄漏自检数据。
+  // （handler 现为 async：模型目录 best-effort 拉取；此处 await 等自检写完再断言。）
   trustFence.fence.rejection = 401
   {
     const res = makeRes()
-    route.handler(req('GET'), res)
+    await route.handler(req('GET'), res)
     check('栅栏拒绝时返回 401', res.state.statusCode === 401, `status=${res.state.statusCode}`)
     check('被拒时不泄漏自检数据', !String(res.state.body ?? '').includes('collab-mode:rules'), String(res.state.body))
   }
@@ -514,22 +520,157 @@ async function verifyPanelMechanism() {
   trustFence.fence.rejection = undefined
   {
     const res = makeRes()
-    route.handler(req('GET'), res)
+    await route.handler(req('GET'), res)
     check('栅栏放行时返回 200', res.state.statusCode === 200, `status=${res.state.statusCode}`)
     const parsed = JSON.parse(String(res.state.body))
     check('自检数据含七个角色', Array.isArray(parsed.value?.roles) && parsed.value.roles.length === 7, String(parsed.value?.roles?.length))
     check('自检数据带版本', typeof parsed.value?.version === 'string' && parsed.value.version !== '', parsed.value?.version)
+    // 两视图的只读展示字段（描述/色标/工具/人设全文，来自 manifest + loader 行）。
+    const roles = parsed.value?.roles ?? []
+    check('自检角色带描述', roles.every((r) => typeof r.description === 'string' && r.description !== ''), JSON.stringify(roles.map((r) => r.description)))
+    check('自检角色带色标', roles.every((r) => typeof r.color === 'string' && r.color !== ''), JSON.stringify(roles.map((r) => r.color)))
+    check('自检角色带工具清单', roles.every((r) => Array.isArray(r.tools) && r.tools.length > 0), JSON.stringify(roles.map((r) => (r.tools ?? []).length)))
+    check('自检角色带拒绝清单', roles.every((r) => Array.isArray(r.denied)), 'not array')
+    check('自检角色带人设全文', roles.every((r) => typeof r.persona === 'string' && r.persona.length > 50), JSON.stringify(roles.map((r) => (r.persona ?? '').length)))
+    // 夹具 ctx 里没有 llm 服务 → 模型目录必须为 null，面板走降级路径。
+    check('无 llm 服务时模型目录为 null', parsed.value.modelCatalog === null, JSON.stringify(parsed.value?.modelCatalog))
   }
 
   // 非 GET → 405。
   {
     const res = makeRes()
-    route.handler(req('POST'), res)
+    await route.handler(req('POST'), res)
     check('非 GET 返回 405', res.state.statusCode === 405, `status=${res.state.statusCode}`)
   }
 }
 
 await verifyPanelMechanism()
+
+/* ---- T12b：模型目录（编辑页"模型"下拉的数据源，best-effort 只读） ---- */
+console.log('\nT12b 模型目录')
+async function verifyModelCatalog() {
+  const loader = makeFakeLoader()
+  const settings = makeFakeSettings()
+  const webServer = makeFakeWebServer()
+  const trustFence = makeFakeTrustFence()
+  const llm = {
+    listProviders() {
+      return [
+        { id: 'p1', name: 'P One' },
+        { id: 'p2', name: '' },
+        { id: '', name: 'NoId' },
+      ]
+    },
+    async listModels(id) {
+      if (id === 'p1') return [{ id: 'm1', name: 'M One' }, { id: 'm2', name: '' }, { id: '', name: 'NoId' }, null]
+      throw new Error('adapter down')
+    },
+  }
+  const figured = makeCtx({ loader: loader.service, settings: settings.service, webServer: webServer.service, connection: trustFence.service, llm })
+  apply(figured.ctx, { logDir: join(root, 'logs4') })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const route = webServer.routes.find((r) => r.path === '/api/collab-mode/selfcheck')
+  check('带 llm 时路由已注册', route !== undefined, JSON.stringify(webServer.routes.map((r) => r.path)))
+  const state = { statusCode: 0, body: undefined }
+  const res = {
+    get statusCode() { return state.statusCode },
+    set statusCode(value) { state.statusCode = value },
+    setHeader: () => {},
+    end: (body) => { state.body = body },
+  }
+  await route.handler({ method: 'GET', url: '/api/collab-mode/selfcheck', headers: {} }, res)
+  check('模型目录 200', state.statusCode === 200, `status=${state.statusCode}`)
+  const parsed = JSON.parse(String(state.body))
+  const providers = parsed.value?.modelCatalog?.providers ?? []
+  check('目录列出两个合法供应商', providers.map((p) => p.id).join(',') === 'p1,p2', JSON.stringify(providers.map((p) => p.id)))
+  check('供应商回退名称', providers.find((p) => p.id === 'p2')?.name === 'p2', JSON.stringify(providers.find((p) => p.id === 'p2')))
+  check('模型枚举正确', JSON.stringify((providers.find((p) => p.id === 'p1')?.models ?? []).map((m) => m.id)) === JSON.stringify(['m1', 'm2']), JSON.stringify(providers.find((p) => p.id === 'p1')?.models))
+  check('模型回退名称', (providers.find((p) => p.id === 'p1')?.models ?? []).find((m) => m.id === 'm2')?.name === 'm2', JSON.stringify((providers.find((p) => p.id === 'p1')?.models ?? []).find((m) => m.id === 'm2')))
+  check('坏供应商被容忍（models 空）', JSON.stringify(providers.find((p) => p.id === 'p2')?.models ?? null) === JSON.stringify([]), JSON.stringify(providers.find((p) => p.id === 'p2')?.models))
+  // 第 7 节自检暴露：包装装着时字段为 true。
+  check('自检暴露 opencodeFreeRelay', parsed.value?.opencodeFreeRelay === true, String(parsed.value?.opencodeFreeRelay))
+}
+
+await verifyModelCatalog()
+
+/* ---- T12c：模型档位（编辑页"推理强度"下拉的数据源，跟随模型） ---- */
+console.log('\nT12c 模型档位')
+async function verifyModelEfforts() {
+  const loader = makeFakeLoader()
+  const settings = makeFakeSettings()
+  const webServer = makeFakeWebServer()
+  const trustFence = makeFakeTrustFence()
+  const llm = {
+    async resolveModelInfo(provider, model) {
+      if (provider === 'zen' && model === 'muse-spark') {
+        return {
+          reasoning: {
+            efforts: [
+              { id: 'low', name: 'Low' },
+              { id: 'high', name: '' },
+              { id: '', name: 'NoId' },
+              null,
+            ],
+            defaultEffort: 'high',
+          },
+        }
+      }
+      if (provider === 'zen' && model === 'plain') return {}
+      throw new Error('unknown route')
+    },
+  }
+  const figured = makeCtx({ loader: loader.service, settings: settings.service, webServer: webServer.service, connection: trustFence.service, llm })
+  apply(figured.ctx, { logDir: join(root, 'logs5') })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const paths = webServer.routes.map((r) => r.path)
+  check('档位路由已注册', paths.includes('/api/collab-mode/model-efforts'), JSON.stringify(paths))
+  check('自检路由仍在（双注册不断）', paths.includes('/api/collab-mode/selfcheck'), JSON.stringify(paths))
+  const route = webServer.routes.find((r) => r.path === '/api/collab-mode/model-efforts')
+  const call = async (url, method = 'GET') => {
+    const state = { statusCode: 0, headers: {}, body: undefined }
+    await route.handler({ method, url, headers: {} }, {
+      get statusCode() { return state.statusCode },
+      set statusCode(value) { state.statusCode = value },
+      setHeader: (k, v) => { state.headers[k] = v },
+      end: (body) => { state.body = body },
+    })
+    return state
+  }
+  {
+    const state = await call('/api/collab-mode/model-efforts?provider=zen&model=muse-spark')
+    check('档位查询 200', state.statusCode === 200, `status=${state.statusCode}`)
+    const parsed = JSON.parse(String(state.body))
+    check('档位列出合法项', JSON.stringify((parsed.value?.efforts ?? []).map((e) => e.id)) === JSON.stringify(['low', 'high']), String(state.body))
+    check('档位名称回退 id', (parsed.value?.efforts ?? []).find((e) => e.id === 'high')?.name === 'high', String(state.body))
+    check('默认档位透出', parsed.value?.defaultEffort === 'high', String(state.body))
+  }
+  {
+    const state = await call('/api/collab-mode/model-efforts?provider=zen')
+    check('缺参数 400', state.statusCode === 400, `status=${state.statusCode}`)
+  }
+  {
+    const state = await call('/api/collab-mode/model-efforts?provider=zen&model=nope')
+    const parsed = JSON.parse(String(state.body))
+    check('未知模型 200 且 efforts null', state.statusCode === 200 && parsed.value?.efforts === null, `${state.statusCode} ${state.body}`)
+  }
+  {
+    const state = await call('/api/collab-mode/model-efforts?provider=zen&model=plain')
+    const parsed = JSON.parse(String(state.body))
+    check('无档位概念回 null', state.statusCode === 200 && parsed.value?.efforts === null, `${state.statusCode} ${state.body}`)
+  }
+  {
+    const state = await call('/api/collab-mode/model-efforts?provider=zen&model=muse-spark', 'POST')
+    check('非 GET 返回 405', state.statusCode === 405, `status=${state.statusCode}`)
+  }
+  {
+    trustFence.fence.rejection = 401
+    const state = await call('/api/collab-mode/model-efforts?provider=zen&model=muse-spark')
+    check('栅栏拒绝时返回 401', state.statusCode === 401, `status=${state.statusCode}`)
+    trustFence.fence.rejection = undefined
+  }
+}
+
+await verifyModelEfforts()
 
 /* ---- T13：客户端半侧防线（v0.2.1 补） ---- */
 console.log('\nT13 客户端半侧：settingsScope 必须是声明依赖')
@@ -613,17 +754,208 @@ async function verifyClientHalf() {
   client.apply(ctx)
 
   check('bind 用命名空间 collab-mode', bound !== null && bound.namespace === 'collab-mode', JSON.stringify(bound))
-  check('注册了 settings.plugin.item 卡片', slotsRegistrations.length === 1, String(slotsRegistrations.length))
+  check('注册了 settings.section 独立导航', slotsRegistrations.length === 1 && slotsRegistrations[0]?.options?.name === 'settings.section', JSON.stringify(slotsRegistrations.map((r) => r.options?.name)))
   const card = slotsRegistrations[0]
-  check('卡片 key 是 collab-mode', card.options.key === 'collab-mode', String(card.options.key))
-  check('卡片 order 是 130', card.options.order === 130, String(card.options.order))
+  check('section id 是 collab-mode', card.options.id === 'collab-mode', String(card.options.id))
+  check('section order 是 79', card.options.order === 79, String(card.options.order))
+  check('section label 是协作模式', card.options.label === '协作模式', String(card.options.label))
+  check('不再注册 settings.plugin.item', slotsRegistrations.every((r) => r.options?.name !== 'settings.plugin.item'), JSON.stringify(slotsRegistrations.map((r) => r.options?.name)))
 
   const injected = card.options.inject()
   check('卡片拿到的 scope 不是 null（v0.2.0 缺陷回归）', injected.scope !== null && injected.scope !== undefined, String(injected.scope))
   check('卡片拿到的 scope 可用', injected.scope.getSnapshot().status === 'ready', JSON.stringify(injected.scope.getSnapshot()))
+  check('注册时标记 section 视图', injected.asSection === true, JSON.stringify(injected.asSection))
+
+  // 两视图静态标记（ZCode 子智能体页同款结构；行为要 React + DOM，走活体验证）。
+  check('编辑视图有返回列表', source.includes('‹ 返回列表'), 'not found')
+  check('模型下拉有继承默认首项', source.includes('继承默认'), 'not found')
+  check('客户端读取模型目录', source.includes('modelCatalog'), 'not found')
+  check('客户端有列表/编辑视图状态', source.includes('setSelected'), 'not found')
+  check('无新建入口', !source.includes('+ 新建'), 'found')
+  check('无删除入口', !source.includes('删除角色') && !source.includes('删除该'), 'found')
+  check('无 AGENTS.md 注入开关', !source.includes('注入 AGENTS.md'), 'found')
+  check('列表行无可写只读 tag', !source.includes("row.writable ? '可写' : '只读'"), 'found')
+  check('列表行尾用工具计数', source.includes('toolsSide'), 'not found')
+  check('推理强度无 max 档', source.includes("const EFFORTS = ['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh']"), 'EFFORTS mismatch')
+  check('推理强度旧值粘滞', source.includes('effortOptions'), 'not found')
+  check('推理强度跟随模型', source.includes('model-efforts') && source.includes('fetchEfforts') && source.includes('effortSelect'), 'not found')
+  check('档位默认有标记', source.includes('（默认）'), 'not found')
 }
 
 await verifyClientHalf()
+
+/* ---- T14：opencode free 回传剥除（第 7 节） ---- */
+console.log('\nT14 opencode free 回传剥除')
+{
+  // apply() 在夹具启动时已经装过一次包装。
+  check('apply 后包装已安装', opencodeFreeRelayInstalled() === true, String(opencodeFreeRelayInstalled()))
+  uninstallOpencodeFreeRelay()
+  check('卸载后标记为 false', opencodeFreeRelayInstalled() === false, String(opencodeFreeRelayInstalled()))
+
+  const realFetch = globalThis.fetch
+  const calls = []
+  const stubFetch = async (input, init) => {
+    calls.push({ input, init })
+    return { ok: true, stubbed: true }
+  }
+  const headOf = (call) => {
+    if (call.init?.headers !== undefined) return new Headers(call.init.headers)
+    if (typeof Request === 'function' && call.input instanceof Request) return new Headers(call.input.headers)
+    return new Headers()
+  }
+  /** 取转发体文本：init.body 优先，Request 形态读 clone（不消耗原件）。 */
+  const bodyOf = async (call) => {
+    if (typeof call.init?.body === 'string') return call.init.body
+    if (typeof Request === 'function' && call.input instanceof Request) return call.input.clone().text()
+    return ''
+  }
+  globalThis.fetch = stubFetch
+  try {
+    const unwrap1 = installOpencodeFreeRelay()
+    check('安装后标记为 true', opencodeFreeRelayInstalled() === true, String(opencodeFreeRelayInstalled()))
+
+    /* ---- 验收 1a：free 端点 POST 剥除 reasoning 项，其余项原样 ---- */
+    {
+      const body = JSON.stringify({
+        model: 'muse-spark-1.3-contributor-free',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+          { type: 'reasoning', id: 'rs_1', encrypted_content: 'ENC-BLOB', summary: [] },
+          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'hello' }] },
+          { type: 'reasoning', id: 'rs_2', encrypted_content: 'ENC-BLOB-2', summary: [] },
+          { type: 'function_call', call_id: 'c1', name: 'f', arguments: '{}' },
+        ],
+        include: ['reasoning.encrypted_content'],
+      })
+      calls.length = 0
+      await globalThis.fetch('https://opencode.ai/zen/v1/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-client-request-id': 'sess-abc' },
+        body,
+      })
+      const sent = await bodyOf(calls[0])
+      const parsed = JSON.parse(sent)
+      check('1a free 端点 reasoning 项被剔除', parsed.input.filter((i) => i.type === 'reasoning').length === 0, JSON.stringify(parsed.input.map((i) => i.type)))
+      check('1a 其余项原样保留（顺序与类型）', JSON.stringify(parsed.input.map((i) => i.type)) === JSON.stringify(['message', 'message', 'function_call']), JSON.stringify(parsed.input.map((i) => i.type)))
+      check('1a 其余项内容逐字段不变', JSON.stringify(parsed.input[2]) === JSON.stringify({ type: 'function_call', call_id: 'c1', name: 'f', arguments: '{}' }), JSON.stringify(parsed.input[2]))
+      check('1a 顶层其他字段保留', parsed.model === 'muse-spark-1.3-contributor-free' && JSON.stringify(parsed.include) === JSON.stringify(['reasoning.encrypted_content']), JSON.stringify(Object.keys(parsed)))
+    }
+
+    /* ---- 验收 1b：付费 go 端点 body 逐字节不变 ---- */
+    {
+      const body = JSON.stringify({
+        model: 'paid-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+          { type: 'reasoning', id: 'rs_1', encrypted_content: 'ENC-BLOB', summary: [] },
+        ],
+        include: ['reasoning.encrypted_content'],
+      })
+      calls.length = 0
+      await globalThis.fetch('https://opencode.ai/zen/go/v1/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-client-request-id': 'sess-go' },
+        body,
+      })
+      const sent = await bodyOf(calls[0])
+      check('1b 付费 go 端点 body 逐字节不变', sent === body, `${sent.length} vs ${body.length}`)
+      check('1b 付费端点仍做会话头镜像', headOf(calls[0]).get('x-opencode-session') === 'sess-go', String(headOf(calls[0]).get('x-opencode-session')))
+    }
+
+    /* ---- 验收 1c：会话头镜像（带 x-client-request-id / 不带时进程级稳定） ---- */
+    calls.length = 0
+    await globalThis.fetch('https://opencode.ai/zen/v1/responses', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-client-request-id': 'sess-abc', 'x-opencode-session': 'old-static-uuid' },
+      body: JSON.stringify({ input: [] }),
+    })
+    check('1c 会话头被镜像覆盖', headOf(calls[0]).get('x-opencode-session') === 'sess-abc', String(headOf(calls[0]).get('x-opencode-session')))
+    check('1c 原请求头保留', headOf(calls[0]).get('x-client-request-id') === 'sess-abc', String(headOf(calls[0]).get('x-client-request-id')))
+
+    // Request 对象形态也照镜像。
+    calls.length = 0
+    await globalThis.fetch(new Request('https://opencode.ai/zen/v1/models', { headers: { 'x-client-request-id': 'sess-r' } }))
+    check('1c Request 形态同样镜像', headOf(calls[0]).get('x-opencode-session') === 'sess-r', String(headOf(calls[0]).get('x-opencode-session')))
+
+    // 不带 x-client-request-id → 进程级稳定 UUID，两次同值。
+    calls.length = 0
+    await globalThis.fetch('https://opencode.ai/zen/v1/models')
+    const u1 = headOf(calls[0]).get('x-opencode-session')
+    await globalThis.fetch('https://opencode.ai/zen/v1/models')
+    const u2 = headOf(calls[1]).get('x-opencode-session')
+    const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    check('1c 兜底是 UUID v4', uuidV4.test(u1 ?? ''), String(u1))
+    check('1c 兜底两次同值（进程级稳定）', u1 !== null && u1 === u2, `${u1} vs ${u2}`)
+
+    /* ---- 验收 1d：非 opencode 域零接触（headers 与 body 均零改动） ---- */
+    {
+      const body = JSON.stringify({ input: [{ type: 'reasoning', id: 'rs_1', encrypted_content: 'ENC' }] })
+      calls.length = 0
+      await globalThis.fetch('https://example.com/anything', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-client-request-id': 'sess-x' },
+        body,
+      })
+      check('1d 他域不加会话头', headOf(calls[0]).get('x-opencode-session') === null, String(headOf(calls[0]).get('x-opencode-session')))
+      check('1d 他域原头不动', headOf(calls[0]).get('x-client-request-id') === 'sess-x', String(headOf(calls[0]).get('x-client-request-id')))
+      check('1d 他域 body 逐字节不变', (await bodyOf(calls[0])) === body, 'body changed')
+      check('1d 他域 init 对象原样透传', calls[0].init.body === body, 'init replaced')
+    }
+
+    /* ---- 验收 1e：非法 JSON body 原样透传；unwrap 还原；重复 install 不叠层 ---- */
+    {
+      const body = '{"input": [ this is not json '
+      calls.length = 0
+      await globalThis.fetch('https://opencode.ai/zen/v1/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+      })
+      check('1e 非法 JSON body 原样透传', (await bodyOf(calls[0])) === body, 'body changed')
+      check('1e 非法 JSON 仍做会话头镜像', headOf(calls[0]).get('x-opencode-session') !== null, 'no session header')
+    }
+
+    // 无 reasoning 项时也不改写字节。
+    {
+      const body = JSON.stringify({ input: [{ type: 'message', role: 'user', content: [] }] })
+      calls.length = 0
+      await globalThis.fetch('https://opencode.ai/zen/v1/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+      })
+      check('1e 无 reasoning 项时 body 原样', (await bodyOf(calls[0])) === body, 'body changed')
+    }
+
+    // 非 JSON content-type 不做剥除。
+    {
+      const body = JSON.stringify({ input: [{ type: 'reasoning', id: 'rs_1', encrypted_content: 'E' }] })
+      calls.length = 0
+      await globalThis.fetch('https://opencode.ai/zen/v1/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'text/plain' },
+        body,
+      })
+      check('1e 非 JSON content-type 不剥除', (await bodyOf(calls[0])) === body, 'body changed')
+    }
+
+    // 重复安装不叠层。
+    const f1 = globalThis.fetch
+    const unwrap2 = installOpencodeFreeRelay()
+    check('1e 重复安装返回同一 unwrap', unwrap1 === unwrap2, '')
+    check('1e 重复安装不换包装', globalThis.fetch === f1, '')
+
+    // unwrap 恢复原 fetch。
+    unwrap1()
+    check('1e 卸载后标记为 false', opencodeFreeRelayInstalled() === false, String(opencodeFreeRelayInstalled()))
+    check('1e 卸载后 fetch 恢复', globalThis.fetch === stubFetch, '')
+  } finally {
+    globalThis.fetch = realFetch
+  }
+  // 恢复初始条件（apply 装过的状态），不影响进程后续。
+  installOpencodeFreeRelay()
+  check('恢复安装后标记为 true', opencodeFreeRelayInstalled() === true, String(opencodeFreeRelayInstalled()))
+}
 
 rmSync(root, { recursive: true, force: true })
 

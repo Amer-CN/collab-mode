@@ -1,20 +1,30 @@
 /**
  * dsh-collab-mode —— 浏览器半侧。
  *
- * 只做一件事：把「协作模式」卡片注册进官方插槽 `settings.plugin.item`，
- * key 等于本插件的 settings 命名空间 `collab-mode`。
+ * 只做一件事：把「协作模式」注册为设置左侧导航的独立 section，
+ * id `collab-mode`、order 79（使用统计 80 的上方）、label `协作模式`。
+ * 页内是 ZCode 子智能体页同款两视图（列表 / 编辑），语义按 DSH：
+ *   列表：7 行（色点 + 名称 + 模型 chip + 工具计数 + 描述）+ 搜索，
+ *     点一行进编辑；行上无可写/只读 tag，未注册才红字提示；B/C/D 原样排下方。
+ *   编辑：名称/颜色/描述/工具/人设全文只读展示，模型（供应商→模型两级下拉）
+ *     + 推理强度（跟随选中模型的 advertised 档位，查不到回退静态全集）
+ *     + maxTokens 可改，保存只写当前行；不做新建/删除/启用开关。
  *
- * 两份账本都齐才会渲染（`@deepseek-ai/dsh-client-ui-settings-plugins` 的设计）：
+ * 两份账本都齐才会渲染：
  *   Host 侧注册了 `collab-mode` 命名空间（见 lib/index.js 的 installSection），
- *   浏览器侧在 `settings.plugin.item` 上注册 key 为该命名空间的卡片。
- * 任一缺失时官方标签页什么都不渲染 —— 所以本卡片的「找不到条目」降级文案是
- * 卡片自己内部的可读提示，而不是指望标签页兜底。
+ *   浏览器侧在 `settings.section` 上注册 id 为 collab-mode 的导航。
+ * 任一缺失时对应位置什么都不渲染 —— 所以本卡片的「找不到条目」降级文案是
+ * 卡片自己内部的可读提示，而不是指望外壳兜底。
  *
  * 数据通道：
  *   A/B 区块的读写走原生 client settings scope（`ctx.settingsScope.bind`），
  *   不经过自建 HTTP bridge —— 与 dsh-free-search 的取舍不同，那个插件写于
  *   settingsScope 可用之前。C 区块的运行时自检走宿主侧的一条只读路由
- *   `/api/collab-mode/selfcheck`（Host 半侧用 webServer.register 提供）。
+ *   `/api/collab-mode/selfcheck`（Host 半侧用 webServer.register 提供），
+ *   自检 payload 里 roles[] 的描述/颜色/工具/人设全文只读字段与顶层的
+ *   modelCatalog（可用供应商→模型目录，拿不到就 null）都只读，不可写回。
+ *
+ * 命名空间缺失/不可写仍由卡片内 `status !== 'ready'` 分支提示。
  *
  * 模块格式：客户端模块系统要求的 lazy-CJS factory（照 dsh-free-search/lib/client.js）。
  */
@@ -28,6 +38,7 @@ window.__ModuleLoader__.load({
 
     const NS = 'collab-mode'
     const SELFCHECK_URL = '/api/collab-mode/selfcheck'
+    const EFFORTS_URL = '/api/collab-mode/model-efforts'
 
     /**
      * 七个角色行：与 Host 半侧 build.mjs 展开出的 ROLES 同序，用于渲染七行。
@@ -43,8 +54,23 @@ window.__ModuleLoader__.load({
       { key: 'vision-reader', label: 'vision-reader', writable: false },
     ]
 
-    /** 推理强度枚举，来自 dsh-tool-subagent 的 agentOptions.reasoningEffort。 */
-    const EFFORTS = ['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+    /**
+     * 推理强度枚举，来自 dsh-tool-subagent 的 agentOptions.reasoningEffort。
+     * 注意这是静态全集（对话窗口是按模型 advertised efforts 动态过滤的，
+     * 所以某些模型在窗口里没有 max 档）。muse-spark-1.3 两个模型都不支持 max，
+     * 用户决策去掉 max 档；已存的 max 值用粘滞选项展示，改选即消除。
+     */
+    const EFFORTS = ['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh']
+
+    /**
+     * 角色配色：DSH 面板自用的 7 色展示映射（纯展示常量，与 CSS 同类）。
+     * 用户决策：不要颜色选择功能；7 个角色各配一色，好看且易区分。
+     * 注意 manifest zcode.color 是另一套（ZCode frontmatter 的源），两者是各平台的
+     * 显示偏好，不要求一致 —— 因此 advisor 三席在这里是绿/粉/黄（与本机 ZCode 三席
+     * 文件头一致），researcher 用蓝（把绿让给 advisor-A，避免撞车）。
+     */
+    const COLOR_HEX = { red: '#e5534b', orange: '#e8933c', yellow: '#d29922', green: '#3fb950', teal: '#39c5cf', blue: '#58a6ff', purple: '#a371f7', pink: '#f778ba' }
+    const ROLE_COLORS = { executor: 'orange', 'code-reviewer': 'red', researcher: 'blue', 'advisor-A': 'green', 'advisor-B': 'pink', 'advisor-C': 'yellow', 'vision-reader': 'purple' }
 
     const CSS = [
       '.dshcm-card{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);border-radius:8px;min-width:0;list-style:none;transition:border-color .16s,background .16s;overflow:hidden;margin-bottom:8px}',
@@ -92,6 +118,32 @@ window.__ModuleLoader__.load({
       '.dshcm-selfRow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--dsw-alias-label-secondary)}',
       '.dshcm-mono{font-variant-numeric:tabular-nums;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dsw-alias-label-primary)}',
       '.dshcm-roleDef{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:1.6;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}',
+      '.dshcm-list{border:0;background:transparent;overflow:hidden}',
+      '.dshcm-rowBtn{width:100%;text-align:left;font:inherit;color:inherit;background:0 0;border:0;border-bottom:1px solid var(--dsw-alias-border-l2);padding:12px 8px;display:flex;gap:12px;cursor:pointer;align-items:center;box-sizing:border-box}',
+      '.dshcm-rowBtn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}',
+      '.dshcm-rowBtn:disabled{cursor:default}',
+      '.dshcm-rowBtn:last-child{border-bottom:0}',
+      '.dshcm-dot{flex:none;width:10px;height:10px;border-radius:50%}',
+      '.dshcm-roleName{font-size:14px}',
+      '.dshcm-rowMain{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}',
+      '.dshcm-rowTop{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}',
+      '.dshcm-route{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;font-weight:600;color:var(--dsw-alias-label-primary)}',
+      '.dshcm-routeDim{font-size:12.5px;color:var(--dsw-alias-label-tertiary)}',
+      '.dshcm-rowDesc{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:1.5;white-space:nowrap;text-overflow:ellipsis;overflow:hidden}',
+      '.dshcm-rowSide{flex:none;display:flex;align-items:center;gap:8px}',
+      '.dshcm-tools{font-size:11px;color:var(--dsw-alias-label-tertiary);white-space:nowrap}',
+      '.dshcm-go{font-size:14px;color:var(--dsw-alias-label-tertiary);flex:none}',
+      '.dshcm-effort{font-size:12px;color:var(--dsw-alias-label-tertiary)}',
+      '.dshcm-colorOnce{display:inline-flex;align-items:center;gap:8px}',
+      '.dshcm-count{color:var(--dsw-alias-label-secondary);margin:0;font-size:12px}',
+      '.dshcm-crumb{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--dsw-alias-label-secondary)}',
+      '.dshcm-back{font:inherit;cursor:pointer;border:0;background:0 0;color:var(--dsw-alias-state-business-primary);font-size:13px;padding:0}',
+      '.dshcm-pre{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-3);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:8px 10px;margin:0;max-height:220px;overflow:auto}',
+      '.dshcm-colorRow{display:flex;gap:8px;flex-wrap:wrap;align-items:center;min-height:22px}',
+      '.dshcm-swatch{width:18px;height:18px;border-radius:50%;border:2px solid transparent;box-sizing:border-box}',
+      '.dshcm-swatchOn{border-color:var(--dsw-alias-label-primary)}',
+      '.dshcm-swatchOff{opacity:.35}',
+      '.dshcm-static{font:inherit;color:var(--dsw-alias-label-primary);font-size:13px}',
     ].join('')
 
     const tagId = 'dsh-collab-mode/card.css'
@@ -174,6 +226,35 @@ window.__ModuleLoader__.load({
       return ops
     }
 
+    /** 单个角色的草稿 → mutation 操作（编辑视图保存只写这一行，不碰开关）。 */
+    function opsFromRole(rowKey, route) {
+      const ops = []
+      const fields = [
+        ['provider', route.provider.trim()],
+        ['model', route.model.trim()],
+        ['reasoningEffort', route.reasoningEffort],
+      ]
+      for (const [field, text] of fields) {
+        const path = ['routes', rowKey, field]
+        if (text === '') ops.push({ op: 'unset', path })
+        else ops.push({ op: 'set', path, value: text })
+      }
+      const maxTokens = route.maxTokens.trim()
+      const path = ['routes', rowKey, 'maxTokens']
+      if (maxTokens === '') ops.push({ op: 'unset', path })
+      else ops.push({ op: 'set', path, value: Number(maxTokens) })
+      return ops
+    }
+
+    /** 单个角色的 maxTokens 校验（编辑视图只拦这一行，不连坐其他角色）。 */
+    function roleInvalid(rowKey, route) {
+      const maxTokens = route.maxTokens.trim()
+      if (maxTokens !== '' && !(Number.isFinite(Number(maxTokens)) && Number(maxTokens) > 0)) {
+        return 'maxTokens 必须是正数，或留空'
+      }
+      return null
+    }
+
     /** 草稿里数值字段是否可解析；不可解析就阻塞保存而不是悄悄改写用户输入。 */
     function draftInvalid(draft) {
       const threshold = Number(draft.declarationThreshold)
@@ -209,6 +290,29 @@ window.__ModuleLoader__.load({
         return body && body.ok === true ? { ok: true, value: body.value } : { ok: false, message: (body && body.message) || '自检路由返回了失败结果' }
       } catch (error) {
         return { ok: false, message: `无法访问自检路由：${error && error.message ? error.message : String(error)}` }
+      }
+    }
+
+    /**
+     * 查一个模型的 advertised 推理档位（对话窗口同源：`llm.resolveModelInfo`）。
+     * 进程级记忆（key = provider/model），失败回 null —— 调用方回退静态全集。
+     */
+    const effortsMemo = {}
+    async function fetchEfforts(provider, model) {
+      try {
+        const url = `${EFFORTS_URL}?provider=${encodeURIComponent(provider)}&model=${encodeURIComponent(model)}`
+        const response = await fetch(url, {
+          headers: { accept: 'application/json' },
+          credentials: 'same-origin',
+        })
+        if (!response.ok) return null
+        const body = await response.json()
+        if (!body || body.ok !== true || body.value === undefined || body.value === null) return null
+        const v = body.value
+        if (!Array.isArray(v.efforts) || v.efforts.length === 0) return null
+        return v
+      } catch (error) {
+        return null
       }
     }
 
@@ -268,10 +372,11 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** 「协作模式」卡片本体。 */
+    /** 「协作模式」卡片本体。section 路径下默认展开、静态标题（不折叠）。 */
     function CollabModeCard(props) {
-      const { scope, clientCtx } = props
-      const [open, setOpen] = react.useState(false)
+      const { scope, clientCtx, asSection } = props
+      const isSection = asSection === true
+      const [open, setOpen] = react.useState(isSection)
       const [snapshot, setSnapshot] = react.useState(scope === null ? null : scope.getSnapshot())
       const [draft, setDraft] = react.useState(emptyDraft)
       const [dirty, setDirty] = react.useState(false)
@@ -281,6 +386,11 @@ window.__ModuleLoader__.load({
       const [loadingCheck, setLoadingCheck] = react.useState(false)
       const [probing, setProbing] = react.useState(false)
       const [probe, setProbe] = react.useState(null)
+      // 两视图状态：selected 为 null = 列表视图，否则为正在编辑的角色 key。
+      const [selected, setSelected] = react.useState(null)
+      const [query, setQuery] = react.useState('')
+      // 当前编辑行的 advertised 档位：{ key: 'provider\nmodel', value }，value null = 回退静态。
+      const [effortDyn, setEffortDyn] = react.useState({ key: null, value: null })
 
       // 订阅原生 scope：宿主侧写入、外部编辑 settings.yaml 都会推新快照过来。
       react.useEffect(() => {
@@ -304,6 +414,31 @@ window.__ModuleLoader__.load({
       react.useEffect(() => {
         if (open && check === null) void refreshCheck()
       }, [open, check, refreshCheck])
+
+      // 编辑行的供应商/模型变了就重查 advertised 档位；未选模型时清空回静态。
+      const selProvider = selected === null ? '' : (draft.routes[selected] === undefined ? '' : draft.routes[selected].provider.trim())
+      const selModel = selected === null ? '' : (draft.routes[selected] === undefined ? '' : draft.routes[selected].model.trim())
+      react.useEffect(() => {
+        if (selected === null || selProvider === '' || selModel === '') {
+          if (effortDyn.key !== null || effortDyn.value !== null) setEffortDyn({ key: null, value: null })
+          return undefined
+        }
+        const key = `${selProvider}\n${selModel}`
+        if (effortDyn.key === key) return undefined
+        if (Object.hasOwn(effortsMemo, key)) {
+          setEffortDyn({ key, value: effortsMemo[key] })
+          return undefined
+        }
+        let cancelled = false
+        void (async () => {
+          const found = await fetchEfforts(selProvider, selModel)
+          effortsMemo[key] = found
+          if (!cancelled) setEffortDyn({ key, value: found })
+        })()
+        return () => {
+          cancelled = true
+        }
+      }, [selected, selProvider, selModel])
 
       const edit = (mutate) => {
         setDraft((prev) => {
@@ -334,6 +469,22 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // 编辑视图的保存：只写当前这一行的四个路由字段，不碰开关与其他角色。
+      const saveRole = async (rowKey) => {
+        if (scope === null || roleInvalid(rowKey, draft.routes[rowKey]) !== null) return
+        setSaving(true)
+        setFailed(null)
+        try {
+          await scope.mutate(opsFromRole(rowKey, draft.routes[rowKey]), snapshot === null ? undefined : snapshot.revision)
+          setDirty(false)
+          await refreshCheck()
+        } catch (error) {
+          setFailed(error && error.message ? error.message : String(error))
+        } finally {
+          setSaving(false)
+        }
+      }
+
       const probeRoles = async () => {
         setProbing(true)
         setProbe(null)
@@ -355,7 +506,23 @@ window.__ModuleLoader__.load({
       const status = snapshot === null ? 'unavailable' : snapshot.status
       const disabled = status !== 'ready' || snapshot === null || snapshot.writable !== true
 
-      const header = h(
+      const header = isSection
+        ? h(
+          'div',
+          { className: 'dshcm-header' },
+          h(
+            'span',
+            { className: 'dshcm-headText' },
+            h('span', { className: 'dshcm-name' }, '协作模式'),
+            h(
+              'span',
+              { className: 'dshcm-description' },
+              '按角色指定子智能体的模型与推理强度，并查看插件是否真的生效',
+            ),
+          ),
+          dirty ? h('span', { className: 'dshcm-pending' }, '未保存') : null,
+        )
+        : h(
         'button',
         { type: 'button', className: 'dshcm-header', onClick: () => setOpen((v) => !v) },
         h(
@@ -372,7 +539,7 @@ window.__ModuleLoader__.load({
         h('span', { className: 'dshcm-chevron' + (open ? ' dshcm-chevronOpen' : '') }, '▾'),
       )
 
-      if (!open) {
+      if (!isSection && !open) {
         return h('li', { className: 'dshcm-card' }, header)
       }
 
@@ -400,76 +567,243 @@ window.__ModuleLoader__.load({
         )
       }
 
-      // A 区块：角色路由。
-      const roleNodes = ROLE_ROWS.map((row) => {
-        const route = draft.routes[row.key]
-        const live = check !== null && check.ok === true ? check.value.roles.find((r) => r.key === row.key) : undefined
+      // A 区块：角色路由 —— ZCode 子智能体页同款两视图（列表 / 编辑），语义按 DSH。
+      // 自检 enrichment：描述/颜色/工具/人设全文只读展示；模型目录给编辑页下拉用。
+      const liveRoles = check !== null && check.ok === true && Array.isArray(check.value.roles) ? check.value.roles : null
+      const liveByKey = (key) => (liveRoles === null ? undefined : liveRoles.find((r) => r.key === key))
+      const catalog = check !== null && check.ok === true && check.value.modelCatalog !== undefined && check.value.modelCatalog !== null
+        ? check.value.modelCatalog
+        : null
+      const useCatalog = catalog !== null && Array.isArray(catalog.providers) && catalog.providers.length > 0
+
+      const q = query.trim().toLowerCase()
+      const visibleRows = ROLE_ROWS.filter((row) => {
+        if (q === '') return true
+        const live = liveByKey(row.key)
+        const hay = `${row.key} ${row.label} ${live !== undefined && live.description ? live.description : ''}`.toLowerCase()
+        return hay.includes(q)
+      })
+
+      // 模型路由：等宽半粗体正文（行内主角，不套 pill）；继承会话用灰字降噪；
+      // 推理强度后缀更淡一档 —— 每行都有 @max，全黑就成噪音了。
+      const routeNode = (row) => {
+        const live = liveByKey(row.key)
+        if (live === undefined) return h('span', { className: 'dshcm-routeDim' }, '…')
+        if (live.provider === '' && live.model === '') return h('span', { className: 'dshcm-routeDim' }, '继承会话')
+        const main = `${live.provider === '' ? '?' : live.provider}/${live.model === '' ? '?' : live.model}`
+        if (!live.reasoningEffort) return h('span', { className: 'dshcm-route' }, main)
+        return h('span', null, h('span', { className: 'dshcm-route' }, main), h('span', { className: 'dshcm-effort' }, ` @${live.reasoningEffort}`))
+      }
+      // 行尾：正常时只有 11px 灰字计数；未注册红字警告 —— 行上唯一的 pill。
+      const toolsSide = (row) => {
+        const live = liveByKey(row.key)
+        if (live === undefined) return h('span', { className: 'dshcm-tools' }, '…')
+        if (!live.registered) return h('span', { className: 'dshcm-tag dshcm-tagRo' }, '未注册')
+        const n = Array.isArray(live.tools) ? live.tools.length : 0
+        return h('span', { className: 'dshcm-tools' }, n > 0 ? `${n} 工具` : '')
+      }
+      const rowDesc = (row) => {
+        const live = liveByKey(row.key)
+        if (live === undefined) return '自检加载中…'
+        return live.description !== '' ? live.description : '（暂无描述）'
+      }
+      const rowDot = (row) => {
+        const color = ROLE_COLORS[row.key] || ''
+        return h('span', { className: 'dshcm-dot', style: { background: COLOR_HEX[color] || 'var(--dsw-alias-label-dimmed)' } })
+      }
+
+      // 列表视图：7 行（色点 + 名称 + 模型 chip + 工具计数 + 描述），点行进编辑。
+      const listBlock = h(
+        'div',
+        { className: 'dshcm-block', key: 'roles' },
+        h('span', { className: 'dshcm-blockTitle' }, 'A. 角色路由'),
+        h('p', { className: 'dshcm-count' }, `共 ${ROLE_ROWS.length} 个角色，点一行进入编辑`),
+        h('input', {
+          className: 'dshcm-input',
+          value: query,
+          placeholder: '搜索角色…',
+          disabled,
+          onChange: (e) => setQuery(e.target.value),
+        }),
+        h(
+          'div',
+          { className: 'dshcm-list' },
+          ...visibleRows.map((row) =>
+            h(
+              'button',
+              { type: 'button', className: 'dshcm-rowBtn', key: row.key, disabled, onClick: () => setSelected(row.key) },
+              rowDot(row),
+              h(
+                'span',
+                { className: 'dshcm-rowMain' },
+                h(
+                  'span',
+                  { className: 'dshcm-rowTop' },
+                  h('span', { className: 'dshcm-roleName' }, row.label),
+                  routeNode(row),
+                ),
+                h('span', { className: 'dshcm-rowDesc' }, rowDesc(row)),
+              ),
+              h(
+                'span',
+                { className: 'dshcm-rowSide' },
+                toolsSide(row),
+                h('span', { className: 'dshcm-go' }, '›'),
+              ),
+            ),
+          ),
+        ),
+      )
+
+      /** 下拉框的选项（含"继承默认"首项 + 当前值粘滞，目录里没有也不丢）。 */
+      const providerOptions = (current) => {
+        const opts = [{ value: '', label: '继承默认' }]
+        if (useCatalog) {
+          for (const p of catalog.providers) {
+            opts.push({ value: p.id, label: p.name === p.id ? p.id : `${p.name}（${p.id}）` })
+          }
+        }
+        if (current !== '' && !opts.some((o) => o.value === current)) opts.push({ value: current, label: `${current}（当前）` })
+        return opts
+      }
+      const modelOptions = (provider, current) => {
+        const opts = [{ value: '', label: '继承默认' }]
+        const seen = new Set([''])
+        const pushAll = (models) => {
+          for (const m of models) {
+            if (m === null || typeof m !== 'object' || typeof m.id !== 'string' || seen.has(m.id)) continue
+            seen.add(m.id)
+            opts.push({ value: m.id, label: m.name === m.id ? m.id : `${m.name}（${m.id}）` })
+          }
+        }
+        if (useCatalog) {
+          if (provider === '') {
+            for (const p of catalog.providers) if (Array.isArray(p.models)) pushAll(p.models)
+          } else {
+            const hit = catalog.providers.find((x) => x.id === provider)
+            if (hit !== undefined && Array.isArray(hit.models)) pushAll(hit.models)
+          }
+        }
+        if (current !== '' && !seen.has(current)) opts.push({ value: current, label: `${current}（当前）` })
+        return opts
+      }
+      /** 推理强度选项：EFFORTS 全集 + 已存旧值粘滞（如下拉里没有 max 但草稿是 max）。 */
+      const effortOptions = (current) => {
+        const opts = EFFORTS.map((effort) => ({ value: effort, label: effort === '' ? '（继承）' : effort }))
+        if (current !== '' && !opts.some((o) => o.value === current)) opts.push({ value: current, label: `${current}（当前）` })
+        return opts
+      }
+      /**
+       * 推理强度下拉：有 advertised 档位就按模型的来（默认档标出），
+       * 否则回退静态全集。首项永远是"继承"，已存旧值粘滞保留。
+       */
+      const effortSelect = (rowKey, route, dyn) => {
+        const current = route.reasoningEffort
+        let options
+        if (dyn === null || dyn.value === null) {
+          options = effortOptions(current)
+        } else {
+          options = [{ value: '', label: '（继承）' }]
+          const seen = new Set([''])
+          for (const e of dyn.value.efforts) {
+            if (e === null || typeof e !== 'object' || typeof e.id !== 'string' || seen.has(e.id)) continue
+            seen.add(e.id)
+            const label = e.id === dyn.value.defaultEffort && dyn.value.defaultEffort !== ''
+              ? `${e.name || e.id}（默认）`
+              : (e.name && e.name !== e.id ? `${e.name}（${e.id}）` : e.id)
+            options.push({ value: e.id, label })
+          }
+          if (current !== '' && !seen.has(current)) options.push({ value: current, label: `${current}（当前）` })
+        }
         return h(
           'div',
-          { className: 'dshcm-role', key: row.key },
+          { className: 'dshcm-field' },
+          h('span', { className: 'dshcm-label' }, '推理强度'),
+          h(
+            'select',
+            {
+              className: 'dshcm-select',
+              value: current,
+              disabled,
+              onChange: (e) => edit((next) => {
+                next.routes[rowKey].reasoningEffort = e.target.value
+              }),
+            },
+            ...options.map((o) => h('option', { key: o.value, value: o.value }, o.label)),
+          ),
+        )
+      }
+      const selectField = (labelText, value, options, onPick) =>
+        h(
+          'div',
+          { className: 'dshcm-field' },
+          h('span', { className: 'dshcm-label' }, labelText),
+          h(
+            'select',
+            { className: 'dshcm-select', value, disabled, onChange: (e) => onPick(e.target.value) },
+            ...options.map((o) => h('option', { key: o.value, value: o.value }, o.label)),
+          ),
+        )
+      const textField = (labelText, value, placeholderText, onType) =>
+        h(
+          'div',
+          { className: 'dshcm-field' },
+          h('span', { className: 'dshcm-label' }, labelText),
+          h('input', { className: 'dshcm-input', value, placeholder: placeholderText, disabled, onChange: (e) => onType(e.target.value) }),
+        )
+      // 模型字段：有目录就"供应商 → 模型"两级下拉，否则回退原来的文本输入。
+      const routeModelControls = (rowKey, route) => {
+        if (!useCatalog) {
+          return [
+            textField('供应商', route.provider, '留空 = 继承会话', (v) => edit((next) => { next.routes[rowKey].provider = v })),
+            textField('模型', route.model, '留空 = 继承会话', (v) => edit((next) => { next.routes[rowKey].model = v })),
+          ]
+        }
+        return [
+          selectField('供应商', route.provider, providerOptions(route.provider), (v) => edit((next) => { next.routes[rowKey].provider = v })),
+          selectField('模型', route.model, modelOptions(route.provider, route.model), (v) => edit((next) => { next.routes[rowKey].model = v })),
+        ]
+      }
+
+      // 编辑视图：名称/颜色/描述/工具/人设全文只读，模型+推理强度+maxTokens 可改。
+      const editBlock = (rowKey) => {
+        const found = ROLE_ROWS.find((r) => r.key === rowKey)
+        const row = found === undefined ? ROLE_ROWS[0] : found
+        const route = draft.routes[row.key]
+        const live = liveByKey(row.key)
+        const perInvalid = roleInvalid(row.key, route)
+        const colorName = ROLE_COLORS[row.key] || ''
+        const deniedList = live !== undefined && Array.isArray(live.denied) ? live.denied : []
+        return h(
+          'div',
+          { className: 'dshcm-block', key: `edit-${row.key}` },
           h(
             'div',
-            { className: 'dshcm-roleHead' },
-            h('span', { className: 'dshcm-roleName' }, row.label),
-            h('span', { className: 'dshcm-tag' + (row.writable ? '' : ' dshcm-tagRo') }, row.writable ? '可写' : '只读'),
-            live === undefined
-              ? null
-              : h(
-                  'span',
-                  { className: live.registered ? 'dshcm-tag dshcm-tagOk' : 'dshcm-tag' },
-                  live.registered
-                    ? `生效：${live.provider === '' && live.model === '' ? '继承会话' : `${live.provider || '?'}/${live.model || '?'}${live.reasoningEffort ? ` @${live.reasoningEffort}` : ''}`}`
-                    : '未注册',
-                ),
+            { className: 'dshcm-crumb' },
+            h('button', { type: 'button', className: 'dshcm-back', onClick: () => setSelected(null) }, '‹ 返回列表'),
+            h('span', null, `协作模式 ＞ ${row.label}`),
           ),
           h(
             'div',
             { className: 'dshcm-grid' },
+            h('div', { className: 'dshcm-field' }, h('span', { className: 'dshcm-label' }, '名称'), h('span', { className: 'dshcm-static' }, row.label)),
             h(
               'div',
               { className: 'dshcm-field' },
-              h('span', { className: 'dshcm-label' }, '供应商'),
-              h('input', {
-                className: 'dshcm-input',
-                value: route.provider,
-                placeholder: '留空 = 继承会话',
-                disabled,
-                onChange: (e) => edit((next) => {
-                  next.routes[row.key].provider = e.target.value
-                }),
-              }),
-            ),
-            h(
-              'div',
-              { className: 'dshcm-field' },
-              h('span', { className: 'dshcm-label' }, '模型'),
-              h('input', {
-                className: 'dshcm-input',
-                value: route.model,
-                placeholder: '留空 = 继承会话',
-                disabled,
-                onChange: (e) => edit((next) => {
-                  next.routes[row.key].model = e.target.value
-                }),
-              }),
-            ),
-            h(
-              'div',
-              { className: 'dshcm-field' },
-              h('span', { className: 'dshcm-label' }, '推理强度'),
+              h('span', { className: 'dshcm-label' }, '颜色标记'),
               h(
-                'select',
-                {
-                  className: 'dshcm-select',
-                  value: route.reasoningEffort,
-                  disabled,
-                  onChange: (e) => edit((next) => {
-                    next.routes[row.key].reasoningEffort = e.target.value
-                  }),
-                },
-                ...EFFORTS.map((effort) => h('option', { key: effort, value: effort }, effort === '' ? '（继承）' : effort)),
+                'span',
+                { className: 'dshcm-colorOnce' },
+                h('span', { className: 'dshcm-dot', style: { background: COLOR_HEX[colorName] || 'var(--dsw-alias-label-dimmed)' } }),
+                h('span', { className: 'dshcm-static' }, colorName === '' ? '（未知）' : colorName),
               ),
             ),
+          ),
+          h(
+            'div',
+            { className: 'dshcm-grid' },
+            ...routeModelControls(row.key, route),
+            effortSelect(row.key, route, selected === row.key ? effortDyn : null),
             h(
               'div',
               { className: 'dshcm-field' },
@@ -486,20 +820,73 @@ window.__ModuleLoader__.load({
               }),
             ),
           ),
+          h('div', { className: 'dshcm-field' }, h('span', { className: 'dshcm-label' }, '描述'), h('span', { className: 'dshcm-static' }, live !== undefined && live.description !== '' ? live.description : '（暂无描述）')),
+          h(
+            'div',
+            { className: 'dshcm-field' },
+            h('span', { className: 'dshcm-label' }, '可用工具'),
+            row.writable
+              ? h('p', { className: 'dshcm-note' }, '全部工具：可写角色不受 toolFilter 限制。')
+              : h(
+                'span',
+                { className: 'dshcm-rowTop' },
+                ...(deniedList.length > 0
+                  ? deniedList.map((t) => h('span', { key: t, className: 'dshcm-tag dshcm-tagRo' }, t))
+                  : [h('span', { key: 'unknown', className: 'dshcm-tag' }, '只读')]
+                )),
+            row.writable ? null : h('p', { className: 'dshcm-note' }, '以上工具被 toolFilter.deny 摘除，只读角色不可改。'),
+          ),
+          h(
+            'div',
+            { className: 'dshcm-field' },
+            h('span', { className: 'dshcm-label' }, '系统提示词（只读）'),
+            live !== undefined && live.persona !== ''
+              ? h('pre', { className: 'dshcm-pre' }, live.persona)
+              : h('p', { className: 'dshcm-note' }, '自检不可用时无法显示。人设正文的单一来源是仓库 content/roles/*.md，这里不提供编辑。'),
+          ),
+          h(
+            'div',
+            { className: 'dshcm-footer' },
+            h(
+              'span',
+              { className: perInvalid === null ? 'dshcm-note' : 'dshcm-error' },
+              perInvalid !== null ? perInvalid : failed !== null ? `保存失败：${failed}` : dirty ? '有未保存的修改' : '与宿主一致',
+            ),
+            h(
+              'div',
+              { className: 'dshcm-footerRight' },
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dshcm-btn dshcm-discard',
+                  disabled: !dirty || saving,
+                  onClick: () => {
+                    setDraft(draftFromValue(snapshot === null ? null : snapshot.value))
+                    setDirty(false)
+                    setFailed(null)
+                  },
+                },
+                '放弃修改',
+              ),
+              h(
+                'button',
+                { type: 'button', className: 'dshcm-btn dshcm-save', disabled: disabled || !dirty || saving || perInvalid !== null, onClick: () => void saveRole(row.key) },
+                saving ? '保存中…' : '保存',
+              ),
+            ),
+          ),
         )
-      })
+      }
 
-      body.push(
-        h(
-          'div',
-          { className: 'dshcm-block', key: 'roles' },
-          h('span', { className: 'dshcm-blockTitle' }, 'A. 角色路由'),
-          h('p', { className: 'dshcm-note' }, '留空的字段表示该角色继承当前会话的模型路由；填了就以这里为准，保存后立即生效。'),
-          ...roleNodes,
-        ),
-      )
+      if (selected === null) {
+        body.push(listBlock)
+      } else {
+        body.push(editBlock(selected))
+      }
 
-      // B 区块：纪律开关。
+      if (selected === null) {
+      // B 区块：纪律开关（只在列表视图展示，编辑视图只改当前行）。
       body.push(
         h(
           'div',
@@ -649,6 +1036,11 @@ window.__ModuleLoader__.load({
           ),
         ),
       )
+      }
+
+      if (isSection) {
+        return h('div', { className: 'dshcm-card dshcm-cardOpen' }, header, h('div', { className: 'dshcm-body' }, ...body))
+      }
 
       return h('li', { className: 'dshcm-card dshcm-cardOpen' }, header, h('div', { className: 'dshcm-body' }, ...body))
     }
@@ -662,11 +1054,9 @@ window.__ModuleLoader__.load({
      * 一次性读取就永远拿到 `undefined`，卡片锁死在降级态 —— v0.2.0 的面板
      * 不可编辑就是这个原因。
      *
-     * 代价：`settingsScope` 缺席时整个客户端插件不加载、卡片不出现。经核实
-     * 这个损失是空的：`settings.plugin.item` 插槽本身由
-     * `dsh-client-ui-settings-plugins` 的 ConfigurablePluginsTab 声明，而它的
-     * `inject` 也含 `settingsScope` —— 服务缺席时插槽根本不存在，卡片无处注册。
-     * 命名空间级降级（宿主未服务该 ns / memory 模式不可写）仍由卡片内
+     * 代价：`settingsScope` 缺席时整个客户端插件不加载、面板不出现。
+     * 保留 settingsScope 硬依赖，因为 scope.bind 仍需要它：命名空间级降级
+     * （宿主未服务该 ns / memory 模式不可写）仍由卡片内
      * `status !== 'ready'` 分支给出可读原因。
      */
     const inject = ['slots', 'settingsScope']
@@ -675,15 +1065,14 @@ window.__ModuleLoader__.load({
       // inject 满足后 Cordis 才调 apply，此时服务必定可用。
       const scope = ctx.settingsScope.bind({ namespace: NS })
 
-      ctx.slots.inject('settings.plugin.item', () =>
+      ctx.slots.inject('settings.section', () =>
         ctx.slots.register(
           {
-            name: 'settings.plugin.item',
-            key: NS,
-            id: 'dsh-collab-mode',
-            // 排在 Free Search（order 120）之后。
-            order: 130,
-            inject: () => ({ scope, clientCtx: ctx }),
+            name: 'settings.section',
+            id: 'collab-mode',
+            order: 79,
+            label: '协作模式',
+            inject: () => ({ scope, clientCtx: ctx, asSection: true }),
           },
           CollabModeCard,
         ),

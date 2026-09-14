@@ -1,5 +1,6 @@
 # 协作模式的开发工作区与临时产物（不进仓库）
 .work/
+.superpowers/
 tmp/
 backups/
 *.zip
