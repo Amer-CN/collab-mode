@@ -6,7 +6,7 @@
 
 **ZCode 装 Skill · DeepSeek Harness 装插件 · 内容同源，AI 自动识别**
 
-[![Version](https://img.shields.io/badge/Version-v1.2.0-1F4E79?style=for-the-badge)](#-版本历史)
+[![Version](https://img.shields.io/badge/Version-v1.3.0-1F4E79?style=for-the-badge)](#-版本历史)
 [![Subagents](https://img.shields.io/badge/子智能体-7个-3B82F6?style=for-the-badge)](#-能力矩阵)
 [![License](https://img.shields.io/badge/License-MIT-10B981?style=for-the-badge)](./zcode-collab/LICENSE)
 [![AgentSkills](https://img.shields.io/badge/AgentSkills-Standard-8B5CF6?style=for-the-badge)](https://agentskills.io)
@@ -205,10 +205,11 @@ collab-mode/
 ## 📜 版本历史
 
 <details>
-<summary><b>当前 v1.2.0</b>（2026-09-12）· v1.0.0 → v1.2.0 完整明细点击展开</summary>
+<summary><b>当前 v1.3.0</b>（2026-09-16）· v1.0.0 → v1.3.0 完整明细点击展开</summary>
 
 | 版本 | 内容 |
 |------|------|
+| **v1.3.0（2026-09-16）** | **DSH 插件运行可视化与面板迭代**（内容源未动，manifest 保持 1.4.0；插件包 0.5.0→0.5.1）：对话窗 dock 运行卡（审计日志只读重建已完成行、折叠、官方时间格式、列对齐）＋右栏常驻竖列（三段式卡片、跳转官方子代理对话、官方同源标题）＋速率列（settled 步 outputTokens/decodeMs，官方口径，缺数标未知）＋角色标记色恢复可编辑（三面联动）＋面板大改版（官方原生风、C 运行状态折叠、生效路由四列表、D 角色定义整段删除）＋保存统一草稿制（行内保存不回滚）＋版本自检横幅（远端比对，离线静默）。三件套全绿、活体全过 |
 | **v1.2.0（2026-09-12）** | **双适配 + 单一内容源**：① 新增 DeepSeek Harness 插件 `dsh-collab-mode`（五个角色工具 + 协作纪律提示段 + 三个代码级钩子 + 设置面板），与 ZCode Skill 共用同一套规则内容；② `content/` 提为**唯一事实源**（manifest.json 描述角色与平台差异），ZCode 侧 agent-*.md 由 `sync_from_manifest.py` 生成，DSH 侧由 `build.mjs` 生成——此前两边手工同步曾导致插件丢失 10 条规则（"不要 git commit""有立场禁止和稀泥"等），已全部回补；③ 仓库由 `zcode-collab` 改名为 `collab-mode`，一个仓库同时服务两种 Agent，README 提供 AI 自识别安装提示词 |
 | v1.1.6（2026-09-11） | **非 ASCII 路径乱码修复**（v1.1.5 加的诊断串首次真实调用即定位）：`enforce-flow.ps1` 与 `session-start-enforce.ps1` 用 `[Console]::In.ReadToEnd()` 以文本模式读 stdin，会按控制台代码页（中文 Windows 为 GBK）解码，而 ZCode 管送的是 UTF-8 —— 中文目录名（如 `E:\测试`、`F:\...	okens速度显示`）被解成乱码。后果：① 简报查找从乱码路径出发 → `briefs=0` → 已登记文件也被判未申报 → 误拦；② 状态键由乱码路径算出 → 记到影子项目下 → 用正确路径永远反算不出（此前离线穷举无解的真正原因，已用 sha256 精确复现验证）。修法：与 post-tool-audit/stop-enforce 统一为「按原始字节读 + UTF-8 解码」。附带清理 33 个乱码键孤儿状态文件（多数属 `E:\测试` —— 即该项目全部会话都在被误拦）。回归：中文路径 4 项 + ASCII 6 项全过 |
 | v1.1.5（2026-09-11） | enforce-flow「真实调用与手动运行结果不一致」修复：① **拦截文案附诊断串** `[cwd=… sid=… key=state-….json briefs=N]`（此前无法从外部反推钩子实际使用的 projectDir 与 state-key，排障只能靠猜）；② **字段拼写容错**——sessionId / session_id 两种拼写都接受（若真实载荷是 camelCase 而钩子只读 snake_case，同一载荷会落到不同 state-key，正是「真实=拦、手动=放」的成因）；cwd / project_dir / projectDir 同理，且缺 cwd 时回退到目标文件所在目录；③ **规范化统一**——路径统一 `GetFullPath`→反斜杠→去尾斜杠→小写，state-key 与简报查找共用同一函数；④ **双树简报查找**——被改文件可能在会话项目之外（如用户级插件目录），项目树与目标文件树两处都找简报（并集）。另：post-tool-audit 耗时字段容错（durationMs/duration_ms/duration/elapsedMs）。12 项回归全过 |

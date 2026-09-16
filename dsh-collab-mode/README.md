@@ -57,13 +57,13 @@ dsh plugin --profile web remove dsh-collab-mode
 | 视图 | 内容 | 落点 |
 |---|---|---|
 | 列表 | 7 行（色点 + 名称 + 模型 chip + 工具计数 + 描述，一行截断）＋搜索框，点行进编辑；行上无可写/只读 tag，未注册才红字提示；B/C/D 原样排在列表下方 | 自检 roles[] 的描述/颜色/路由/工具清单（只读展示） |
-| 编辑 | 面包屑（协作模式 ＞ 角色名）＋名称（只读）/颜色标记（只读）/供应商→模型两级下拉/推理强度（跟随选中模型的 advertised 档位，默认档有标记；未选模型或查不到时回退静态全集 off…xhigh）/maxTokens/描述（只读）/可用工具（只读）/系统提示词（只读）＋保存/放弃/返回列表 | 下拉选项来自自检 `modelCatalog`（`llm` 服务全目录）与只读路由 `GET /api/collab-mode/model-efforts`；拿不到就降级，绝不白屏。供应商一切换自动清空模型＋档位（防幽灵组合）；目录里没有的旧值标红字"失效，目录无此项"且不可提交 |
+| 编辑 | 面包屑（协作模式 ＞ 角色名）＋名称（只读）/颜色标记（8 色点选，当前行单独保存）/供应商→模型两级下拉/推理强度（跟随选中模型的 advertised 档位，默认档有标记；未选模型或查不到时回退静态全集 off…xhigh）/maxTokens/描述（只读）/可用工具（只读）/系统提示词（只读）＋保存/放弃/返回列表 | 下拉选项来自自检 `modelCatalog`（`llm` 服务全目录）与只读路由 `GET /api/collab-mode/model-efforts`；拿不到就降级，绝不白屏。供应商一切换自动清空模型＋档位（防幽灵组合）；目录里没有的旧值标红字"失效，目录无此项"且不可提交 |
 
 | 区块 | 内容 | 落点 |
 |---|---|---|
 | B 纪律开关 | `gate` / `audit` / `warnOnTurnEnd` + 未声明文件阈值 + 审计目录 | settings 命名空间 `collab-mode` |
-| C 自检 | 插件版本、提示段字符数、七个角色工具**是否已注册**、各自**实际生效路由**、审计目录、最近一条审计记录、刷新与探测按钮 | 宿主只读路由 `GET /api/collab-mode/selfcheck`（另带 `modelCatalog`，best-effort，失败回 null） |
-| D 角色定义 | 每行的 loader 行 id / 是否运行 / toolFilter 条数 / persona 字符数（只读） | 同一自检路由 |
+| C 自检 | 运行卡显示（总开关/行数/折叠数/列勾选，草稿制）＋运行状态折叠组（插件版本、提示段字符数、七个角色工具是否已注册、生效路由四列表、审计目录、最近一条审计记录、刷新与探测按钮） | 宿主只读路由 `GET /api/collab-mode/selfcheck`（另带 `modelCatalog`，best-effort，失败回 null） |
+| D 角色定义 | 已移除（v1.3.0，面板嫌长；看角色定义直接读仓库 `content/roles/*.md`） | — |
 
 A/B 的读写走**原生 client settings scope**（`ctx.settingsScope.bind`），不经过自建 HTTP bridge；`unset` 用于「留空」，因此清空字段是退回组合层默认值，而不是写一个空串进用户层。
 
