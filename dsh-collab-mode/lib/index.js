@@ -8,6 +8,17 @@
  *   2. 改动前拦截 `tools/pre-execute`：本会话未声明生产文件累计到阈值 → deny，并列出文件名。
  *   3. 审计 `tools/post-execute`：每次工具调用追加一行 JSON 日志（ts/sid/tool/target/ok/latency）。
  *   4. 轮次结束告警 `agent/turn-stopping`：有未声明改动 → 通过 `agent.steer` 告警并列出文件名；否则静默。
+ *   5. 子智能体运行列表：同一对工具钩子顺手记下七个角色的起止与真实 provider/model，
+ *      折叠成只读列表经自检路由给对话窗口的 dock 卡与右栏竖列（对话转录不注入任何进度行）。
+ *      已完成行另从审计日志只读重建，因此 `dsh web` 重启后卡里仍有历史（running 行
+ *      是内存态，重启即空 —— 符合设计）。
+ *      每行另从子会话事件只读累加 settled 步的 outputTokens/decodeMs（口径与官方
+ *      `sessionStats` 投影逐字段相同），供「速率」列使用；没有上报的行标未知。
+ *      显示形态由客户端面板可配（`dockCardVisible` / `dockRows` / `dockFold` /
+ *      `dockColumns` 四个字段，只影响客户端渲染哪几个面、显示多少行，宿主不据此做事）。
+ *      同一份命名空间里还有 `roleColors`（角色 key → 8 色之一）：编辑页写它，列表色点、
+ *      dock 行色条、右栏卡片色条三处读它。宿主只做白名单归一化（非法/缺项回落默认），
+ *      色值与渲染全在客户端。
  *
  * 钩子走 DSH 的代码级事件，不依赖 `@deepseek-ai/dsh-hooks-claude-code` 适配器，
  * 也不复用 ZCode 的 PowerShell 脚本（任务书第三节设计决策 1）。
@@ -18,7 +29,17 @@
  * @module dsh-collab-mode
  */
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, parse, resolve } from 'node:path'
 import z from '@deepseek-ai/schemastery'
@@ -41,7 +62,66 @@ const RoleRoute = z.object({
   maxTokens: z.number().default(0),
 })
 
-/** 面板的全部可编辑项。A 区块 = routes，B 区块 = 三个开关 + 阈值。 */
+/**
+ * 一列可显示的运行行字段。`id` 是客户端渲染用的键，`default` 是出厂是否勾选。
+ *
+ * `rate` 是**有数据源**的那一列：宿主从子会话事件累加 settled 步的
+ * outputTokens / decodeMs（口径与官方 `sessionStats` 投影逐字段相同，见 2b 区块的
+ * `foldChildMetrics`），客户端按官方 `formatTokensPerSecond` 渲染。
+ *
+ * 无数据源的占位列（曾有的 `tokenRate` / `turns`）已删除：`rate` 列点亮后它们
+ * 不再有存在的理由，旧设置里残留的键由归一化自动丢弃。
+ */
+const DOCK_COLUMNS = [
+  { id: 'role', label: '角色', default: true },
+  { id: 'route', label: '路由', default: true },
+  { id: 'state', label: '状态', default: true },
+  { id: 'elapsed', label: '耗时', default: true },
+  { id: 'startedAt', label: '开始时刻', default: false },
+  { id: 'rate', label: '速率', default: true },
+]
+
+/** 运行卡/竖列的显示上限：单面最多显示多少行（0 = 不限）。 */
+const DOCK_ROWS_MAX = 50
+/** 折叠时最多显示多少条已完成行。 */
+const DOCK_FOLD_MAX = 20
+
+/**
+ * 角色标记色的合法色名集合（8 色）—— 客户端 `COLOR_HEX` 的键就是这份集合，
+ * 色值本身只活在客户端（宿主不渲染任何颜色）。
+ */
+const ROLE_COLOR_NAMES = ['red', 'orange', 'yellow', 'green', 'teal', 'blue', 'purple', 'pink']
+
+/** 每个角色的出厂默认标记色；面板没给（或给了非法色名）时回落这里。 */
+const DEFAULT_ROLE_COLORS = {
+  executor: 'orange',
+  'code-reviewer': 'red',
+  researcher: 'blue',
+  'advisor-A': 'green',
+  'advisor-B': 'pink',
+  'advisor-C': 'yellow',
+  'vision-reader': 'purple',
+}
+
+/**
+ * 面板里的角色配色 → 生效配色：只认 ROLE_COLOR_NAMES 这 8 个色名，缺项与非法值
+ * 一律回落该角色的出厂默认色（照 `columnsFromPanel` 的样板，但**不抛错** ——
+ * 标记色是显示偏好，为它把整个命名空间打成红色（或让面板保存失败）不值当，
+ * 简报第 3 条要的正是「非法值回落默认、不红不炸」）。
+ */
+function roleColorsFromPanel(panel) {
+  const out = {}
+  for (const role of ROLES) {
+    const value = panel === null || typeof panel !== 'object' ? undefined : panel[role.key]
+    out[role.key] = ROLE_COLOR_NAMES.includes(value) ? value : DEFAULT_ROLE_COLORS[role.key]
+  }
+  return out
+}
+
+/**
+ * 面板的全部可编辑项。A 区块 = routes（+ roleColors），B 区块 = 三个开关 + 阈值，
+ * C 区块 = 运行卡显示形态（dockCardVisible / dockRows / dockFold / dockColumns）。
+ */
 const PANEL_SCHEMA = z.object({
   routes: z
     .object(Object.fromEntries(ROLES.map((role) => [role.key, RoleRoute])))
@@ -51,10 +131,50 @@ const PANEL_SCHEMA = z.object({
   warnOnTurnEnd: z.boolean().default(true),
   declarationThreshold: z.number().default(3),
   logDir: z.string().default(''),
+  /**
+   * 对话窗口那张运行卡（`conversation.input.dock`）的总开关（面板 C 区块，客户端读写）：
+   * false = 整卡不渲染。右栏竖列不受它影响（那里另有自己的 tab 开关）。
+   */
+  dockCardVisible: z.boolean().default(true),
+  /** 运行面显示的行数上限（0 = 不限）。 */
+  dockRows: z.number().default(8),
+  /** 折叠时最多显示多少条「已完成」行（进行中一律全显示）。 */
+  dockFold: z.number().default(3),
+  /** 显示哪些列（客户端按 DOCK_COLUMNS 勾选写入；至少一列由客户端校验）。 */
+  dockColumns: z
+    .object(Object.fromEntries(DOCK_COLUMNS.map((col) => [col.id, z.boolean().default(col.default)])))
+    .default({}),
+  /**
+   * 每个角色的标记色（角色 key → 色名）。编辑页点选后写这里，三处显示面
+   * （设置列表色点 / 对话 dock 行色条 / 右栏卡片色条）都读同一个值。
+   *
+   * 值类型用 `z.any()` 而不是 `z.string()`：非法色名要在**读的时候**回落默认色，
+   * 而不是让 schema 解析抛错 —— 解析失败会连累整个命名空间（注册直接抛错、
+   * 外部改文件时整段值退回上一次的好值）。白名单过滤在 `roleColorsFromPanel` 里。
+   */
+  roleColors: z
+    .object(Object.fromEntries(ROLES.map((role) => [role.key, z.any().default(DEFAULT_ROLE_COLORS[role.key])])))
+    .default({}),
 })
+
+/**
+ * 面板里的列勾选 → 生效值：只认 DOCK_COLUMNS 里的键，缺项或非布尔一律回落到补丁层默认，
+ * 免得客户端写进一个半截对象就把某列永久关掉。
+ */
+function columnsFromPanel(panel, fallback) {
+  const out = {}
+  for (const col of DOCK_COLUMNS) {
+    const value = panel === null || typeof panel !== 'object' ? undefined : panel[col.id]
+    out[col.id] = typeof value === 'boolean' ? value : fallback[col.id]
+  }
+  return out
+}
 
 /** 角色行的 loader entry id（与 v0.1.0 的 id 保持一致，便于识别）。 */
 const roleEntryId = (key) => `collab-${key}`
+
+/** 七个角色工具名 —— 「工具调用 → 角色」的唯一映射（审计重建也用同一个集合）。 */
+const ROLE_TOOLS = new Set(ROLES.map((role) => role.tool))
 
 /** 角色行的完整 config：loader 改写时要以它为底，避免丢字段。 */
 function roleRowConfig(role, route) {
@@ -105,6 +225,16 @@ const DEFAULTS = {
   rulesOrder: 400,
   /** 审计日志目录；默认 `$DSH_HOME/hooks`。 */
   logDir: undefined,
+  /** 对话窗口运行卡的总开关（面板 C 区块）。 */
+  dockCardVisible: true,
+  /** 运行面显示的行数上限（0 = 不限）。 */
+  dockRows: 8,
+  /** 折叠时最多显示多少条已完成行。 */
+  dockFold: 3,
+  /** 勾选了哪些列；缺项由客户端按 DOCK_COLUMNS 的 default 补。 */
+  dockColumns: Object.fromEntries(DOCK_COLUMNS.map((col) => [col.id, col.default])),
+  /** 每个角色的标记色（面板编辑页写；三处显示面读）。 */
+  roleColors: { ...DEFAULT_ROLE_COLORS },
 }
 
 /* ────────────────────────── 配置 ────────────────────────── */
@@ -131,6 +261,29 @@ function resolveConfig(raw) {
   if (cfg.logDir !== undefined && (typeof cfg.logDir !== 'string' || cfg.logDir === '')) {
     throw new Error('collab-mode: `logDir` must be a non-empty string when set')
   }
+  if (typeof cfg.dockCardVisible !== 'boolean') {
+    throw new Error('collab-mode: `dockCardVisible` must be a boolean')
+  }
+  if (!Number.isInteger(cfg.dockRows) || cfg.dockRows < 0 || cfg.dockRows > DOCK_ROWS_MAX) {
+    throw new Error(`collab-mode: \`dockRows\` must be an integer between 0 and ${DOCK_ROWS_MAX}`)
+  }
+  if (!Number.isInteger(cfg.dockFold) || cfg.dockFold < 0 || cfg.dockFold > DOCK_FOLD_MAX) {
+    throw new Error(`collab-mode: \`dockFold\` must be an integer between 0 and ${DOCK_FOLD_MAX}`)
+  }
+  if (cfg.dockColumns === null || typeof cfg.dockColumns !== 'object' || Array.isArray(cfg.dockColumns)) {
+    throw new Error('collab-mode: `dockColumns` must be a mapping of column id → boolean')
+  }
+  for (const col of DOCK_COLUMNS) {
+    const value = cfg.dockColumns[col.id]
+    // 缺项补 default；显式给了就必须是布尔 —— 静默改写用户配错的类型比启动失败更难查。
+    if (value === undefined) cfg.dockColumns[col.id] = col.default
+    else if (typeof value !== 'boolean') throw new Error(`collab-mode: \`dockColumns.${col.id}\` must be a boolean`)
+  }
+  if (cfg.roleColors === null || typeof cfg.roleColors !== 'object' || Array.isArray(cfg.roleColors)) {
+    throw new Error('collab-mode: `roleColors` must be a mapping of role key → color name')
+  }
+  // 色名本身非法只回落默认色，不抛错（与上面几个字段的严格校验不同，见 roleColorsFromPanel）。
+  cfg.roleColors = roleColorsFromPanel(cfg.roleColors)
   return cfg
 }
 
@@ -527,6 +680,92 @@ export function installOpencodeFreeRelay() {
   return uninstallOpencodeFreeRelay
 }
 
+/* ────────────────────────── 远端版本（只读） ────────────────────────── *
+ *
+ * 面板要在插件落后时提示「有新版本」：本地版本读插件自己的 `package.json`，远端版本
+ * 读仓库 main 上那份同文件（判据与 ZCode 侧 `version_check.py` 一致，只是换成本插件的
+ * 版本文件）。
+ *
+ * 三条硬约束（简报）：抓取不阻塞 apply、失败一律静默、2 秒一次的自检轮询不放大远端请求。
+ * 因此：进程内一份缓存（TTL 1 小时）+ 单飞（在飞时复用同一个 promise）；抓取只用 node
+ * 内建 `fetch` + `AbortSignal.timeout(8s)` 熔断；任何失败（离线 / 超时 / 非 200 / 坏 JSON /
+ * 取不到 version）都落成 `null` 并照样计入缓存，绝不抛给调用方、绝不打红面板。
+ */
+
+/** 远端版本文件：仓库 main 上本插件的 package.json。 */
+const UPDATE_URL = 'https://raw.githubusercontent.com/Amer-CN/collab-mode/main/dsh-collab-mode/package.json'
+/** 缓存时长：1 小时。 */
+const UPDATE_TTL_MS = 60 * 60 * 1000
+/** 单次抓取的熔断时限：8 秒。 */
+const UPDATE_TIMEOUT_MS = 8000
+
+/** 远端版本缓存：`at` = 落缓存时刻，`value` = 版本串或 null（没抓到）。 */
+let updateCache = { at: 0, value: null }
+/** 在飞的那一次抓取（单飞：轮询再密也只有一个请求）。 */
+let updateInflight = null
+
+/** `1.10.0` → `[1, 10, 0]`；含非数字段（`v1.2.3`、`abc`、空段）返回 null。 */
+function numericVersion(text) {
+  const out = []
+  for (const part of text.split('.')) {
+    if (!/^\d+$/.test(part)) return null
+    out.push(Number(part))
+  }
+  return out
+}
+
+/**
+ * 本地版本是否落后于远端：按数字段比较（1.10.0 > 1.9.0）；任一侧不可解析时退化为
+ * 「字符串不等即落后」（宁可误报一行字，不漏报）。
+ */
+export function versionIsBehind(local, remote) {
+  if (typeof local !== 'string' || typeof remote !== 'string') return false
+  if (local === '' || remote === '' || local === remote) return false
+  const left = numericVersion(local)
+  const right = numericVersion(remote)
+  if (left === null || right === null) return true
+  const len = Math.max(left.length, right.length)
+  for (let index = 0; index < len; index += 1) {
+    const a = left[index] ?? 0
+    const b = right[index] ?? 0
+    if (a !== b) return b > a
+  }
+  return false
+}
+
+/** 远端 package.json 的 version；任何失败都返回 null（静默）。 */
+async function fetchRemoteVersion() {
+  try {
+    const response = await fetch(UPDATE_URL, {
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(UPDATE_TIMEOUT_MS),
+    })
+    if (response === null || response === undefined || response.ok !== true) return null
+    const body = await response.json()
+    const version = body !== null && typeof body === 'object' ? body.version : undefined
+    return typeof version === 'string' && version.trim() !== '' ? version.trim() : null
+  } catch {
+    return null
+  }
+}
+
+/** 抓一次远端版本并落缓存（成功与失败都落，免得失败也去 hammer 远端）；在飞时复用同一个 promise，绝不抛。 */
+function refreshRemoteVersion() {
+  if (updateInflight !== null) return updateInflight
+  updateInflight = (async () => {
+    const value = await fetchRemoteVersion()
+    updateCache = { at: Date.now(), value }
+    updateInflight = null
+  })()
+  return updateInflight
+}
+
+/** 同步读缓存：过期就在**后台**刷一次（不等待），本次仍用旧值 —— 自检轮询永远不会被网络拖住。 */
+function cachedRemoteVersion() {
+  if (Date.now() - updateCache.at >= UPDATE_TTL_MS) void refreshRemoteVersion()
+  return updateCache.value
+}
+
 /* ────────────────────────── 插件本体 ────────────────────────── */
 
 /**
@@ -556,6 +795,11 @@ export function apply(ctx, rawConfig) {
     warnOnTurnEnd: patchCfg.warnOnTurnEnd,
     declarationThreshold: patchCfg.declarationThreshold,
     logDir: patchCfg.logDir ?? '',
+    dockCardVisible: DEFAULTS.dockCardVisible,
+    dockRows: DEFAULTS.dockRows,
+    dockFold: DEFAULTS.dockFold,
+    dockColumns: { ...DEFAULTS.dockColumns },
+    roleColors: { ...DEFAULTS.roleColors },
   }
 
   /** 角色行的 loader entry id。与 v0.1.0 的补丁行 id 同名，便于识别。 */
@@ -621,6 +865,18 @@ export function apply(ctx, rawConfig) {
         Number.isInteger(panel.declarationThreshold) && panel.declarationThreshold >= 1
           ? panel.declarationThreshold
           : patchCfg.declarationThreshold,
+      dockCardVisible:
+        typeof panel.dockCardVisible === 'boolean' ? panel.dockCardVisible : patchCfg.dockCardVisible,
+      dockRows:
+        Number.isInteger(panel.dockRows) && panel.dockRows >= 0 && panel.dockRows <= DOCK_ROWS_MAX
+          ? panel.dockRows
+          : patchCfg.dockRows,
+      dockFold:
+        Number.isInteger(panel.dockFold) && panel.dockFold >= 0 && panel.dockFold <= DOCK_FOLD_MAX
+          ? panel.dockFold
+          : patchCfg.dockFold,
+      dockColumns: columnsFromPanel(panel.dockColumns, patchCfg.dockColumns),
+      roleColors: roleColorsFromPanel(panel.roleColors),
     }
     const nextLogDir =
       typeof panel.logDir === 'string' && panel.logDir !== '' ? panel.logDir : patchCfg.logDir ?? join(dshHome(), 'hooks')
@@ -643,6 +899,12 @@ export function apply(ctx, rawConfig) {
       validate: (value) => {
         if (!Number.isInteger(value.declarationThreshold) || value.declarationThreshold < 1) {
           throw new Error('collab-mode: declarationThreshold must be a positive integer')
+        }
+        if (!Number.isInteger(value.dockRows) || value.dockRows < 0 || value.dockRows > DOCK_ROWS_MAX) {
+          throw new Error('collab-mode: dockRows must be an integer between 0 and ' + DOCK_ROWS_MAX)
+        }
+        if (!Number.isInteger(value.dockFold) || value.dockFold < 0 || value.dockFold > DOCK_FOLD_MAX) {
+          throw new Error('collab-mode: dockFold must be an integer between 0 and ' + DOCK_FOLD_MAX)
         }
       },
     })
@@ -680,10 +942,650 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  /* ---- 2b. 子智能体运行可视化（只读状态，对话转录一行都不注入） ----
+   *
+   * 起止直接借已有的两个工具钩子（`tools/pre-execute` / `tools/post-execute`）：
+   * 角色工具调用进来时记一行「开始」，出去时把同一 callId 翻成结束。列表按
+   * 开始时间折叠，经自检路由（已过认证栅栏）暴露给对话窗口的 dock 卡。
+   *
+   * 为什么不用 `subagent/start|end`：那两个事件按委派方作用域派发，身上只有
+   * `provider`（子智能体 provider 名，如 `spawn`）和子会话 id，**没有角色名**——
+   * 圆桌三席并发时无法把某个 run 认领给 advisor-A/B/C。工具调用天然带 `exec.name`
+   * 和逐次唯一的 `callId`，是唯一不歧义的键。
+   *
+   * 「真实 provider/model」读请求头，不信子智能体自报：优先取角色行上的
+   * `agentOptions`（面板配的显式路由），留空则读委派方会话的
+   * `session.requestHeader().config` —— 与 `dsh-tool-subagent` 的
+   * `parentAgentOptionsForDelegation` / `resolveChildAgentOptions` 同一套继承语义。
+   *
+   * ⚠ 「没等到 post-execute」**不等于**卡死：前台委派（run_in_background 缺省关闭）
+   * 的 post-execute 要等子智能体整轮跑完才来，实测有一次 executor 的 latency 是
+   * 1970576ms（33 分钟）。只按 startedAt 超时判 stale，会把正在干活的 33 分钟全标成
+   * 「无响应」。所以存活时间 `aliveAt` 由**子会话自己的活动**刷新，且**只刷新它自己
+   * 那一行**（按 `session.header.id` 精确到行，未认领的行才按委派方会话粗刷）：
+   *   - 子智能体每次工具调用（同一个 pre-execute 钩子，agent 是子会话）；
+   *   - 子会话的工具跑完（post-execute，同一钩子）—— 静默长命令结束后立刻回正；
+   *   - 子会话每帧流式输出（`agent/assistant-stream`，payload 带 agent）。
+   * 精确到行是为了圆桌并发：兄弟席一直有活动时，被吞的那一席不该靠别人的活动续命
+   * （旧行为是同一父会话下的在跑行一起刷新，于是那一席永远不转 stale）。
+   *
+   * 另有一个「在飞命令」例外：子会话正在跑一条无事件的静默长命令（几十秒的构建/测试）时，
+   * 上面三种信号一个都不来，光靠 aliveAt 会把它误标成「无响应」。有在飞命令的行
+   * （见 `childTools` / `childBusy`）按「正在干活」处理，存活时间报当前时刻。
+   * 真被吞（拒绝/杀掉/dsh 重启）时子会话不再有任何活动，行才会在 N 秒后转 stale ——
+   * 这正是简报要的「卡死/被吞」。
+   *
+   * ⚠ 重启后内存 Map 为空，但**已完成行从审计日志只读重建**（见 `auditRuns`）：
+   * 重启不再等于整卡消失。running 行无从重建，重启即空 —— 这是设计，不是缺陷。
+   */
+  /** 列表上限：折叠成「最近 N 次委派」，防止长时间会话无限增长。 */
+  const RUN_KEEP = 12
+  /** 单份审计日志最多回看最近这么多行（防无界读）。 */
+  const AUDIT_LOOKBACK = 50
+  /**
+   * 单份审计日志最多读多少**字节**（只读尾部，不整文件读入）。
+   * 一行审计 JSON 约 200 字节，64 KB ≈ 300 行，够 AUDIT_LOOKBACK=50 用有余；
+   * 更老的日志文件再大也不放大单次自检的同步读。
+   */
+  const AUDIT_TAIL_BYTES = 64 * 1024
+  /** 超过这个时长没有任何存活信号 = stale（卡死/被吞）。 */
+  const RUN_STALE_MS = 15000
+  /** callId -> 一行运行记录（插入顺序 = 开始顺序）。 */
+  const runs = new Map()
+  /**
+   * callId -> 子会话 id：子会话**在飞**的非委派工具调用。
+   *
+   * 它修的是误标：子会话跑一条无事件的静默长命令（几十秒的构建/测试）时，既没有
+   * 流式帧也没有新的工具调用，只有 startedAt 在涨 —— 按旧的存活模型，15 秒后这行
+   * 就被标成「无响应」，而它其实正在干活。有在飞命令 = 正在干活（见 childBusy）。
+   */
+  const childTools = new Map()
+
+  /** 一个角色本次实际用的路由：角色行 agentOptions 优先，其次会话请求头。 */
+  function effectiveRoute(agent, roleKey) {
+    const loader = ctx.get('loader')
+    const entry = loader === undefined ? undefined : resolveEntry(loader, roleEntryId(roleKey))
+    const configured = entry?.options?.config?.agentOptions ?? null
+    let header = null
+    try {
+      const session = agent?.session
+      if (session !== null && typeof session === 'object' && typeof session.requestHeader === 'function') {
+        header = session.requestHeader()?.config ?? null
+      }
+    } catch {
+      header = null
+    }
+    const pick = (field) => {
+      const fromRow = configured === null ? undefined : configured[field]
+      if (typeof fromRow === 'string' && fromRow !== '') return { value: fromRow, source: 'row' }
+      const fromHeader = header === null ? undefined : header[field]
+      if (typeof fromHeader === 'string' && fromHeader !== '') return { value: fromHeader, source: 'header' }
+      return { value: '', source: '' }
+    }
+    const provider = pick('provider')
+    const model = pick('model')
+    const effort = pick('reasoningEffort')
+    return {
+      provider: provider.value,
+      model: model.value,
+      reasoningEffort: effort.value,
+      // 'row' = 面板给这个角色配了显式路由；'header' = 继承委派方会话的实际请求头。
+      routeSource: provider.source === '' ? model.source : provider.source,
+    }
+  }
+
+  /** pre-execute：角色工具调用开始。非角色工具只顺手刷一次子会话存活时间。 */
+  function noteRunStart(exec) {
+    if (!ROLE_TOOLS.has(exec.name)) {
+      noteChildToolOpen(exec)
+      touchChild(exec.agent)
+      return
+    }
+    const startedAt = Date.now()
+    const route = effectiveRoute(exec.agent, exec.name)
+    runs.set(exec.callId, {
+      callId: exec.callId,
+      role: exec.name,
+      sid: sessionIdOf(exec.agent) ?? 'unknown',
+      provider: route.provider,
+      model: route.model,
+      reasoningEffort: route.reasoningEffort,
+      routeSource: route.routeSource,
+      startedAt,
+      aliveAt: startedAt,
+      endedAt: 0,
+      ok: null,
+      ms: 0,
+      // ---- 速率累积（只读；口径见 foldChildMetrics） ----
+      /** 认领到的子会话 id（'' = 还没认领）。 */
+      childSid: '',
+      /** 这次委派的 prompt 头（用于同一父会话下有多个未认领行时精确认领）。 */
+      promptHead: promptHeadOf(exec.arguments),
+      /** 官方同源的任务标题（委派参数 description，即官方顶部抽屉显示的 label）。 */
+      description: descriptionOf(exec.arguments),
+      /** 已 settled 步的 outputTokens 累加；null = 还没有「timing 与 outputTokens 齐备」的步。 */
+      rateTokens: null,
+      /** 已 settled 步的 decodeMs 累加（decode = 组装消息时刻 − 首 token 时刻，TTFT 不在内）。 */
+      rateDecodeMs: null,
+      /** 当前未收口的那一步（官方 sessionStats 的同名字段）。 */
+      openStep: null,
+    })
+    // 淘汰跳过在跑行：33 分钟的前台委派行一旦被 12 条新行挤掉，就再也认领不回它的
+    // 子会话（认领靠 runs 里的行），dock 卡上也会凭空消失。只淘汰最老的一条已结束行。
+    while (runs.size > RUN_KEEP) {
+      let victim = null
+      for (const [callId, record] of runs) {
+        if (record.endedAt !== 0) {
+          victim = callId
+          break
+        }
+      }
+      if (victim === null) break
+      runs.delete(victim)
+    }
+  }
+
+  /** 活动源（agent 或 session）→ 子会话自己的 id；不是子会话 / 读不到时返回 ''。 */
+  function childSidOf(source) {
+    try {
+      const session = source?.session ?? source
+      const id = session?.header?.id
+      const parent = session?.header?.parentSession
+      if (typeof id !== 'string' || id === '' || typeof parent !== 'string' || parent === '') return ''
+      return id
+    } catch {
+      return ''
+    }
+  }
+
+  /** 这一行名下还有在飞的命令调用吗（= 正在干活，静默长命令不该被判无响应）。 */
+  function childBusy(record) {
+    if (record.childSid === '') return false
+    for (const sid of childTools.values()) {
+      if (sid === record.childSid) return true
+    }
+    return false
+  }
+
+  /** 子会话的一次非委派工具调用开始：记下「在飞命令」。 */
+  function noteChildToolOpen(exec) {
+    const sid = childSidOf(exec.agent)
+    if (sid !== '') childTools.set(exec.callId, sid)
+  }
+
+  /** 子会话的一次工具调用结束：摘掉「在飞命令」，并补刷一次存活时间。 */
+  function noteChildToolEnd(exec) {
+    childTools.delete(exec.callId)
+    touchChild(exec.agent)
+  }
+
+  /**
+   * 子会话的一次活动 → 刷新它自己那一行的存活时间。
+   *
+   * 认领靠 `session.header.parentSession`（子会话 header 上有委派方会话 id）；
+   * 刷新按 `session.header.id` **精确到行**：圆桌三席并发时，兄弟席的活动不再给
+   * 卡死那一行续命（旧行为是同一父会话下的在跑行一起刷新，于是被吞的那一席永远
+   * 不转 stale）。还没认领到子会话的行保持原语义 —— 按委派方会话粗刷。
+   * 传进来的可以是 agent 也可以是 session；没有 parentSession 时什么都不做
+   * （父会话自己的活动不影响任何行）。
+   */
+  function touchChild(source) {
+    if (runs.size === 0) return
+    let parent = ''
+    let childSid = ''
+    try {
+      const session = source?.session ?? source
+      const fromHeader = session?.header?.parentSession
+      if (typeof fromHeader === 'string') parent = fromHeader
+      const id = session?.header?.id
+      if (typeof id === 'string') childSid = id
+    } catch {
+      parent = ''
+      childSid = ''
+    }
+    if (parent === '') return
+    const now = Date.now()
+    for (const record of runs.values()) {
+      if (record.endedAt !== 0) continue
+      if (record.childSid !== '') {
+        if (record.childSid === childSid) record.aliveAt = now
+        continue
+      }
+      if (record.sid === parent) record.aliveAt = now
+    }
+  }
+
+  /** post-execute：同一 callId 翻成结束。钩子被吞（拒绝/被杀）时这行不执行 → 行留在 running。 */
+  function noteRunEnd(exec, result) {
+    const record = runs.get(exec.callId)
+    if (record === undefined) return
+    record.endedAt = Date.now()
+    record.ok = result?.isError !== true
+    record.ms = record.endedAt - record.startedAt
+  }
+
+  /* ---- 2c. 速率：子会话事件 → 各委派行的 settled 步累积（只读） ----
+   *
+   * 口径与官方输入框下的速度完全一致，逐字段照抄宿主侧的 `sessionStats` 投影
+   * （`@deepseek-ai/dsh-session-stats`，客户端那半是 `deriveTurnMetrics`）：
+   *
+   *   step/start          开一步（记开始时刻，首 token 还没有）
+   *   assistant/attempt   若本步还没记首 token，从它自己的流里取（step 内 llm/retry 后首 token 仍算）
+   *   assistant/message   收口这一步：decode = event.time（组装消息时刻）− 首 token 时刻，
+   *                       且**只有 usage.outputTokens 也有**才累加（两个都齐才算一步）
+   *   step/end            关一步
+   *
+   * 「按 step last-wins」：`assistant/message` 收口后 `openStep` 置空，同一步再来一条不再重复累加；
+   * turn/step 对不上的事件一律忽略（官方同）。`event.time` 就是官方口径里的 completedTime，
+   * 首 token 时刻由 `streamFirstTokenTime` 从嵌入流里还原（与 `assistantStreamFirstTokenTime` 同算法）。
+   *
+   * 只读：不改审计写入、不新增写入路径、不往对话转录注入任何东西、不引入自定义事件类型。
+   * 认领不到子会话（或子会话没上报 usage/timing）时计数保持 null → 客户端渲染「未知」，不编数字。
+   */
+
+  /** 这次委派的 prompt 头：同一父会话下有多个未认领行时用来精确认领（认领规则见 claimRun）。 */
+  function promptHeadOf(args) {
+    const prompt = args !== null && typeof args === 'object' && typeof args.prompt === 'string' ? args.prompt.trim() : ''
+    return prompt === '' ? '' : prompt.slice(0, 120)
+  }
+
+  /** 委派参数里的任务标题（官方顶部抽屉显示的 label 同源；模型没传就是空）。 */
+  function descriptionOf(args) {
+    const text = args !== null && typeof args === 'object' && typeof args.description === 'string' ? args.description.trim() : ''
+    return text === '' ? '' : text.slice(0, 120)
+  }
+
+  /** 官方 `usageOutputTokens`：provider 上报的输出 token 数，缺项或非法一律 null。 */
+  function usageOutputTokens(usage) {
+    if (usage === null || typeof usage !== 'object') return null
+    const value = usage.outputTokens
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+  }
+
+  /** 官方 `isTokenDelta`：一个 chunk 算不算「吐了一个 token」。 */
+  function isTokenDelta(chunk) {
+    if (chunk === null || typeof chunk !== 'object') return false
+    switch (chunk.type) {
+      case 'text-delta':
+      case 'reasoning-delta':
+        return chunk.text !== ''
+      case 'tool-call-delta':
+        return chunk.argumentsDelta !== '' || chunk.name !== undefined
+      default:
+        return false
+    }
+  }
+
+  /**
+   * 官方 `firstRunMemberTime` / `runFirstTokenTime`：被打包的 delta run 里第一个
+   * 合格成员的重构时刻（time0 加上逐项 dt）。形状不对就 null（官方会给 NaN，
+   * 那会把 NaN 累进统计里；这里宁可未知）。
+   */
+  function runFirstTokenTime(run) {
+    if (run === null || typeof run !== 'object' || !Number.isFinite(run.time0)) return null
+    if (run.type === 'tool-call-chunks' && run.name !== undefined) return run.time0
+    const fragments = run.type === 'tool-call-chunks' ? run.args : run.texts
+    const dt = run.dt
+    if (!Array.isArray(fragments) || !Array.isArray(dt)) return null
+    let time = run.time0
+    for (let index = 0; index < fragments.length; index += 1) {
+      if (index > 0) {
+        if (!Number.isFinite(dt[index - 1])) return null
+        time += dt[index - 1]
+      }
+      if (fragments[index] !== '') return time
+    }
+    return null
+  }
+
+  /** 官方 `assistantStreamFirstTokenTime`：一条嵌入流里第一个 token delta 的时刻。 */
+  function streamFirstTokenTime(stream) {
+    if (!Array.isArray(stream)) return null
+    for (const record of stream) {
+      if (record === null || typeof record !== 'object') continue
+      if (record.type === 'chunk') {
+        if (isTokenDelta(record.chunk) && Number.isFinite(record.time)) return record.time
+        continue
+      }
+      const time = runFirstTokenTime(record)
+      if (time !== null) return time
+    }
+    return null
+  }
+
+  /**
+   * 把一条 `session/event` 折进它所属委派行的速率累积。
+   * 只认「和当前开着的那一步 turn/step 对齐」的事件，其余原样忽略（官方同）。
+   */
+  function foldChildMetrics(record, event) {
+    const data = event?.data
+    if (data === null || typeof data !== 'object') return
+    if (event.type === 'step/start') {
+      record.openStep =
+        Number.isFinite(event.time) && Number.isFinite(data.turn) && Number.isFinite(data.step)
+          ? { turn: data.turn, step: data.step, firstTokenTime: null }
+          : null
+      return
+    }
+    if (event.type === 'step/end') {
+      record.openStep = null
+      return
+    }
+    const open = record.openStep
+    if (open === null || open === undefined) return
+    if (data.turn !== open.turn || data.step !== open.step) return
+    if (event.type === 'assistant/attempt') {
+      if (open.firstTokenTime !== null) return
+      const first = streamFirstTokenTime(data.stream)
+      if (first !== null) open.firstTokenTime = first
+      return
+    }
+    if (event.type !== 'assistant/message') return
+    const firstToken = open.firstTokenTime === null ? streamFirstTokenTime(data.stream) : open.firstTokenTime
+    record.openStep = null
+    if (firstToken === null || !Number.isFinite(event.time)) return
+    const outputTokens = usageOutputTokens(data.usage)
+    if (outputTokens === null) return
+    record.rateTokens = (record.rateTokens ?? 0) + outputTokens
+    record.rateDecodeMs = (record.rateDecodeMs ?? 0) + Math.max(0, event.time - firstToken)
+  }
+
+  /**
+   * 把一条子会话事件认领回某个在跑的委派行；认领不到返回 null（该事件丢掉，不猜）。
+   *
+   * 子会话 header 只给得出 `parentSession` —— 官方没有 callId ↔ 子会话的映射（
+   * `subagent/descriptor` 里也没有），所以按这三档认领：
+   *   1. 这个子会话已经认领过 → 直接返回那一行；
+   *   2. 该父会话下只剩**一个**未认领的行 → 认领它（子会话按行的开始顺序创建，一一对应）；
+   *   3. 多个未认领的行 → 用子会话的 user/message 正文与各行记下的 prompt 头比对，唯一命中才认领。
+   * 仍不唯一就不认领 —— 宁可这一行速率未知，也不认错行、不编数字。
+   */
+  function claimRun(session, event) {
+    const childSid = session?.header?.id
+    if (typeof childSid !== 'string' || childSid === '') return null
+    const parent = session?.header?.parentSession
+    if (typeof parent !== 'string' || parent === '') return null
+    const candidates = []
+    for (const record of runs.values()) {
+      if (record.childSid === childSid) return record
+      if (record.childSid === '' && record.sid === parent) candidates.push(record)
+    }
+    if (candidates.length === 0) return null
+    if (candidates.length === 1) {
+      candidates[0].childSid = childSid
+      return candidates[0]
+    }
+    if (event?.type !== 'user/message') return null
+    const content = event.data?.content
+    if (!Array.isArray(content)) return null
+    const text = content
+      .filter((block) => block !== null && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string')
+      .map((block) => block.text)
+      .join('')
+    const hit = candidates.filter((record) => record.promptHead !== '' && text.includes(record.promptHead))
+    if (hit.length !== 1) return null
+    hit[0].childSid = childSid
+    return hit[0]
+  }
+
+  /** 路径 → { size, mtimeMs, lines }：未变的审计文件跳过重读（自检 2 秒一次）。 */
+  const auditTailCache = new Map()
+
+  /**
+   * 只读一个文件**尾部**至多 AUDIT_TAIL_BYTES 字节并切成行（整文件读入的替代）。
+   *
+   * `mtime + size` 没变就直接命中缓存，不再碰盘 —— 长会话里审计文件每次自检都在长，
+   * 但两次自检之间往往没变，缓存把「每次自检都整文件读」摊成「变了才读尾部」。
+   * 读不动 / 打不开一律返回 null（调用方跳过，绝不抛异常打断自检路由）；
+   * 缓存条数封顶，避免很多会话的日志文件把内存撑起来。
+   */
+  function readTailLines(file) {
+    let stat = null
+    try {
+      stat = statSync(file)
+    } catch {
+      return null
+    }
+    const cached = auditTailCache.get(file)
+    if (cached !== undefined && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached.lines
+    let lines = null
+    let fd = -1
+    try {
+      const start = Math.max(0, stat.size - AUDIT_TAIL_BYTES)
+      const length = stat.size - start
+      const buffer = Buffer.allocUnsafe(length)
+      fd = openSync(file, 'r')
+      let read = 0
+      while (read < length) {
+        const got = readSync(fd, buffer, read, length - read, start + read)
+        if (got <= 0) break
+        read += got
+      }
+      lines = buffer.subarray(0, read).toString('utf8').split('\n')
+      // 只可能截断在首行（从窗口起点开始的那一行半截）：丢掉它，宁可少一行也不解析半截 JSON。
+      if (start > 0) lines = lines.slice(1)
+    } catch {
+      return null
+    } finally {
+      if (fd >= 0) {
+        try {
+          closeSync(fd)
+        } catch {
+          /* 关不掉的 fd 不值得打断自检 */
+        }
+      }
+    }
+    if (auditTailCache.size > 32) auditTailCache.clear()
+    auditTailCache.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, lines })
+    return lines
+  }
+
+  /**
+   * 审计日志 → 已完成行（只读重建）。
+   *
+   * 为什么需要：`runs` 是 `apply()` 里的内存 Map，`dsh web` 一重启就空，dock 卡
+   * 随之整卡不渲染 —— 用户看到的是「卡片找不到了」。审计日志 `<logDir>/activity-*.log`
+   * 本来就逐次工具调用记了 `ts/sid/tool/target/ok/latency`，足够把**已完成**的委派行
+   * 重建出来（running 行无从重建，重启即空正是设计）。
+   *
+   * 严格只读：不改审计写入格式、不新增写入路径。读也只读**尾部**（readTailLines：
+   * 单文件字节上限 + mtime 缓存），长会话里日志涨到 MB 级也不会让每次自检卡在同步读上。
+   * 任何一步失败都降级为空列表（= 退回纯内存行为），绝不抛异常打断自检路由。
+   */
+  function auditRuns() {
+    const rows = []
+    try {
+      const files = readdirSync(logDir)
+        .filter((f) => f.startsWith('activity-') && f.endsWith('.log'))
+      // 最近写过的日志文件排前面：行数封顶时优先看真正有活动的会话。
+      const ranked = files
+        .map((f) => {
+          const full = join(logDir, f)
+          let ms = 0
+          try {
+            ms = statSync(full).mtimeMs
+          } catch {
+            ms = 0
+          }
+          return { full, ms }
+        })
+        .sort((a, b) => b.ms - a.ms)
+
+      for (const { full } of ranked) {
+        if (rows.length >= AUDIT_LOOKBACK) break
+        const lines = readTailLines(full)
+        if (lines === null) continue
+        // 只回看最近 AUDIT_LOOKBACK 行（尾部窗口之内，再用行数封一次顶）。
+        const from = Math.max(0, lines.length - AUDIT_LOOKBACK)
+        for (let i = lines.length - 1; i >= from; i -= 1) {
+          if (rows.length >= AUDIT_LOOKBACK) break
+          const line = lines[i].trim()
+          if (line === '') continue
+          let record = null
+          try {
+            record = JSON.parse(line)
+          } catch {
+            continue
+          }
+          if (record === null || typeof record !== 'object') continue
+          const tool = typeof record.tool === 'string' ? record.tool : ''
+          if (!ROLE_TOOLS.has(tool)) continue
+          const endedAt = Date.parse(typeof record.ts === 'string' ? record.ts : '')
+          if (!Number.isFinite(endedAt)) continue
+          const latency = Number.isFinite(record.latency) && record.latency > 0 ? record.latency : 0
+          const sid = typeof record.sid === 'string' && record.sid !== '' ? record.sid : 'unknown'
+          const startedAt = endedAt - latency
+          rows.push({
+            // 合成 callId 防碰撞：审计行没有 callId，用 sid+ts+序号拼一个稳定键。
+            callId: `audit-${sid}-${endedAt}-${rows.length}`,
+            role: tool,
+            sid,
+            // 审计日志里没有路由信息（不改写入格式就拿不到）→ 留空，客户端显示「路由未知」。
+            provider: '',
+            model: '',
+            reasoningEffort: '',
+            routeSource: '',
+            startedAt,
+            aliveAt: endedAt,
+            endedAt,
+            running: false,
+            stale: false,
+            ok: record.ok === true,
+            ms: latency,
+            // 审计六字段里没有 token 列（不改写入格式就拿不到）→ 速率同样未知。
+            rateTokens: null,
+            rateDecodeMs: null,
+            // 内部字段：重建行参与合并后即丢弃，projection 不输出。
+            fromAudit: true,
+          })
+        }
+      }
+    } catch {
+      /* 目录不存在/读不动 → 纯内存，什么都不加 */
+    }
+    return rows
+  }
+
+  /** 内存行 → projection 行（running/stale 按**当前时刻**重算）。 */
+  function memoryRuns(now) {
+    const list = []
+    for (const record of runs.values()) {
+      const running = record.endedAt === 0
+      // 有在飞命令的子会话（无事件的静默长命令）＝ 正在干活：存活时间报当前时刻。
+      // 必须报新值，不能只把 stale 标记压住 —— 客户端另按 aliveAt 自己算 stale（1 秒 tick），
+      // 宿主只压标记的话卡片照样在 15 秒后置灰。
+      const busy = running && childBusy(record)
+      const aliveAt = busy ? now : record.aliveAt
+      list.push({
+        callId: record.callId,
+        role: record.role,
+        sid: record.sid,
+        provider: record.provider,
+        model: record.model,
+        reasoningEffort: record.reasoningEffort,
+        routeSource: record.routeSource,
+        startedAt: record.startedAt,
+        aliveAt,
+        endedAt: record.endedAt,
+        running,
+        stale: running && !busy && now - aliveAt > RUN_STALE_MS,
+        ok: running ? null : record.ok,
+        ms: running ? now - record.startedAt : record.ms,
+        // 速率：已 settled 步的 outputTokens / decodeMs 累加（null = 还没有可计步）。
+        // 运行中只按已收口的步给数，所以在吐字过程中这两个数不会变（与官方同语义）。
+        rateTokens: record.rateTokens,
+        rateDecodeMs: record.rateDecodeMs,
+        // 任务名：委派 prompt 前 120 字（老行回落用），审计行没有。
+        task: record.promptHead,
+        // 卡片标题：官方同源 description，审计行没有。
+        title: record.description,
+        // 子会话 id：跳转按钮的地址（认领成功后才有；审计行没有，无按钮）。
+        childSid: record.childSid,
+        fromAudit: false,
+      })
+    }
+    return list
+  }
+
+  /**
+   * 折叠成列表 projection。每次读取按**当前时刻**重算 running/stale（不起定时器）：
+   * stale 看的是 aliveAt（最后一次存活信号），不是 startedAt —— 见 2b 区块顶部说明。
+   *
+   * 排序后与审计重建行合并再截 RUN_KEEP：内存行里已经有同一次委派的（重启前刚跑完、
+   * 行还在 Map 里），就不再从日志重复补一遍。
+   */
+  function runsProjection() {
+    const now = Date.now()
+    const memory = memoryRuns(now)
+
+    // 去重：审计行与内存里的**已结束**行，角色相同且结束时刻落在同一段（±RUN_STALE_MS）即同一行。
+    const claimed = new Set()
+    const reconstructed = []
+    for (const row of auditRuns()) {
+      let matched = false
+      for (const mem of memory) {
+        if (claimed.has(mem.callId) || mem.role !== row.role || mem.running) continue
+        if (Math.abs(mem.endedAt - row.endedAt) > RUN_STALE_MS) continue
+        claimed.add(mem.callId)
+        matched = true
+        break
+      }
+      if (!matched) reconstructed.push(row)
+    }
+
+    const list = [...memory, ...reconstructed]
+    list.sort((a, b) => a.startedAt - b.startedAt)
+    // 截断同样跳过在跑行：跑了半小时的前台委派不该被一串新行挤出列表
+    // （内存 Map 的淘汰照同一条规则，见 noteRunStart，否则那一行连认领都认不回来）。
+    const active = list.filter((row) => row.running || row.stale)
+    const done = list.filter((row) => !(row.running || row.stale))
+    const kept = list.length > RUN_KEEP
+      ? [...done.slice(Math.max(0, done.length - Math.max(0, RUN_KEEP - active.length))), ...active]
+      : list
+    kept.sort((a, b) => a.startedAt - b.startedAt)
+    // 内部字段不外泄（认领与流解析用的中间态）：projection 的字段与 2b 原有形状逐字一致，
+    // 另加 rateTokens / rateDecodeMs 两个速率字段、task 任务名与 childSid 跳转地址。
+    return kept.map(({ fromAudit, promptHead, description, openStep, ...row }) => row)
+  }
+
+  /**
+   * 速率累积的事件源：`session/event` 火管。
+   *
+   * 为什么这条缝可用（2026-09-15 读 `@deepseek-ai/dsh-session` 与 `@deepseek-ai/dsh-scope` 实证）：
+   * 会话服务的 `append()` 走 `ctx.events.dispatch('emit', [carrier, 'session/event', session, event])`，
+   * 而 `ctx.events` 在**整棵 ctx 树上共用同一个实例**（子 ctx 是 `Object.create(parent)`，
+   * 只有根 ctx 构造 `new EventsService()`），唯一的过滤是 scope carrier 的 filter：
+   * `const tag = scopeOf(hook.ctx); if (tag === undefined) return true` —— 无 scope 标签的监听者
+   * 收**所有**会话的事件。本插件挂在 Host 平面（root → dsh-base → dsh-web-app → 本 bundle），
+   * 没有任何 `createScope` 包裹（那三处调用点在 dsh-agent-loop / dsh-agent-presets /
+   * dsh-api-session-controller，都在会话自己的作用域里），因此子智能体会话的事件也会到这里。
+   *
+   * 认领与累积见 `claimRun` / `foldChildMetrics`；两个都只读，任何一步失败都只是让那一行
+   * 速率保持未知，绝不影响工具链、审计写入与对话转录。
+   */
+  ctx.on('session/event', (session, event) => {
+    if (runs.size === 0) return
+    const record = claimRun(session, event)
+    if (record === null) return
+    foldChildMetrics(record, event)
+  })
+
+  /**
+   * 存活信号之一：子会话每帧流式输出都会派发 `agent/assistant-stream`
+   * （payload 由 `agentEvents` 融进了 `agent`）。这是「子智能体正在思考/正在吐字」
+   * 唯一可用的细粒度信号 —— 一秒几十帧的热路径，所以先看 runs 是否为空、
+   * 再读一次 parentSession，不做任何分配。
+   */
+  ctx.on('agent/assistant-stream', (payload) => {
+    if (runs.size === 0) return
+    touchChild(payload?.agent)
+  })
+
   /* ---- 3. 改动前拦截 ---- */
   ctx.on('tools/pre-execute', async (exec, next) => {
     startedAt.set(exec.callId, Date.now())
     if (startedAt.size > 5000) startedAt.clear()
+    noteRunStart(exec)
 
     if (!live.gate) return next()
     if (!WRITE_TOOLS.has(exec.name)) return next()
@@ -722,6 +1624,10 @@ export function apply(ctx, rawConfig) {
 
   /* ---- 4. 审计：每次工具调用一行 ---- */
   ctx.on('tools/post-execute', async (exec, result, next) => {
+    noteRunEnd(exec, result)
+    // 子会话的工具跑完 = 一次新的存活信号：静默长命令结束后存活时间立刻回正，
+    // 那一行不会停在「无响应」上等人（在飞命令也在这里摘掉）。
+    noteChildToolEnd(exec)
     const started = startedAt.get(exec.callId)
     startedAt.delete(exec.callId)
     const latency = started === undefined ? 0 : Date.now() - started
@@ -967,7 +1873,10 @@ export function apply(ctx, rawConfig) {
     return rows
   }
 
-  /** 审计日志目录里最新的那一条记录（面板 C 区块「最近一条审计」）。 */
+  /**
+   * 审计日志目录里最新的那一条记录（面板 C 区块「最近一条审计」）。
+   * 同样只读尾部（readTailLines）：不因为要看最后一行就把整份日志读进来。
+   */
   function lastAudit() {
     try {
       const files = readdirSync(logDir)
@@ -984,9 +1893,17 @@ export function apply(ctx, rawConfig) {
         }
       }
       if (newest === null) return null
-      const lines = readFileSync(newest, 'utf8').trim().split('\n')
-      const last = lines[lines.length - 1]
-      if (last === undefined || last === '') return null
+      const lines = readTailLines(newest)
+      if (lines === null) return null
+      // 尾部窗口可能以换行收尾：从后往前找第一条非空行。
+      let last = ''
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        if (lines[i].trim() !== '') {
+          last = lines[i].trim()
+          break
+        }
+      }
+      if (last === '') return null
       const record = JSON.parse(last)
       return {
         file: parse(newest).base,
@@ -1001,16 +1918,36 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  /** 自检区快照：面板每次打开/刷新都会拉一次。 */
-  function selfCheck() {
+  /**
+   * 自检区快照：面板每次打开/刷新都会拉一次。
+   *
+   * `updateInfo` = 远端版本比对的只读结果（`{ local, remote|null, behind }`）；拿不到
+   * 远端时 `remote` 为 null、`behind` 为 false —— 离线的正常态，不是错误。
+   */
+  async function selfCheck() {
     let version = ''
     try {
       version = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'package.json'), 'utf8')).version ?? ''
     } catch {
       version = 'unknown'
     }
+    // 冷缓存时等一次「预热抓取」（≤8 秒熔断）：面板第一次打开就能拿到 behind 判定。
+    // 之后一律读缓存 —— 2 秒一次的轮询不会放大远端请求（TTL 1 小时）。
+    if (updateCache.at === 0 && updateInflight !== null) {
+      try {
+        await updateInflight
+      } catch {
+        /* 失败静默：拿不到远端就是 remote null */
+      }
+    }
+    const remote = cachedRemoteVersion()
     return {
       version,
+      updateInfo: {
+        local: version,
+        remote,
+        behind: remote !== null && versionIsBehind(version, remote),
+      },
       namespace: NS,
       rulesSection: patchCfg.rulesSection,
       rulesChars: RULES_TEXT.length,
@@ -1020,9 +1957,19 @@ export function apply(ctx, rawConfig) {
         audit: live.audit,
         warnOnTurnEnd: live.warnOnTurnEnd,
         declarationThreshold: live.declarationThreshold,
+        // 运行卡的显示形态（客户端 C 区块开关写的值；这里只回读给自检对照）。
+        dockCardVisible: live.dockCardVisible,
+        dockRows: live.dockRows,
+        dockFold: live.dockFold,
+        dockColumns: { ...live.dockColumns },
+        // 角色标记色（编辑页写、三处显示面读；非法值已在这一层回落默认色）。
+        roleColors: { ...live.roleColors },
       },
       roles: inspectRoles(),
       lastAudit: lastAudit(),
+      // 2b 区块的运行列表：dock 卡的唯一数据源（只读新增字段，不影响既有字段）。
+      runs: runsProjection(),
+      runsStaleMs: RUN_STALE_MS,
       // 第 7 节探针：面板 C 区块不动 UI，JSON 里可见即可。
       opencodeFreeRelay: opencodeFreeRelayInstalled(),
     }
@@ -1075,7 +2022,7 @@ export function apply(ctx, rawConfig) {
               return
             }
             try {
-              const value = selfCheck()
+              const value = await selfCheck()
               // 模型目录是 best-effort：拿不到就 null，面板降级，绝不 500。
               try {
                 value.modelCatalog = await modelCatalog(serverCtx)
@@ -1130,6 +2077,8 @@ export function apply(ctx, rawConfig) {
 
   // ---- 7. opencode free 回传剥除：装全局 fetch 窄包装（仅 opencode.ai 域）----
   installOpencodeFreeRelay()
+  // ---- 8. 远端版本预热：后台抓一次（不 await），只为让面板第一次打开时缓存已就绪 ----
+  void refreshRemoteVersion()
   // fiber 停止时拆掉（HMR/重载不留残留）；夹具 ctx 没有 effect，守卫跳过。
   if (typeof ctx.effect === 'function') {
     ctx.effect(() => () => uninstallOpencodeFreeRelay())
