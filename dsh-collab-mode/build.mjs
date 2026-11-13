@@ -52,9 +52,16 @@ function readContent(rel) {
  * ⚠ 2026-09-14：删掉 `cordis_define` / `cordis_run` / `cordis_stop` / `cordis_undefine`
  * 四个名字（17 → 13）。它们只由 `@deepseek-ai/dsh-tool-cordis` 提供，而那个包只出现在
  * `presets/cordis/agent.cordis.yml`，默认的 `standard` preset 里没有 —— 名字不可解析会让
- * `restrict()` 整体抛错，7 个角色一个都派不出去。剩下这 13 个在 standard preset 的已知
+ * `restrict()` 整体抛错，7 个角色一个都派不出去。剩下这 12 个在 standard preset 的已知
  * 工具表里全部存在。残余风险：将来某个 DSH 版本把这 4 个恢复进默认 preset，本名单就会
  * 少拦 4 个写操作工具 —— 由「7 角色活体点名」当探测器（委派会响亮地失败），见 README。
+ *
+ * ⚠ 2026-10-07：删掉 `ralph`（13 → 12）。它在 DSH 0.2.0-rc.2 的 base 层就是
+ * `disabled: true`（两侧 profile 的 `--dump-config` 实测都是 `- id: tool-ralph … disabled: true`），
+ * 因此从来不在「已知全局工具表」里 —— 与上面同一类故障：名字不可解析，`restrict()` 直接抛错，
+ * 7 个角色一个都派不出去（实测报错 `tools.restrict() names unknown global tool "ralph"`）。
+ * 残余风险：将来某个 DSH 版本把 `ralph` 恢复进默认 preset 且它仍是可变更工具，本名单就会
+ * 少拦一个名字 —— 同样由「7 角色活体点名」当探测器（委派会响亮地失败），见 README。
  *
  * ⚠ Z-Code 侧不用这份名单（它是 DSH `tools.restrict()` 的机制，不属于两平台共用内容），
  * 所以本改动对 Z-Code 零影响。
@@ -78,7 +85,6 @@ const MUTATING_TOOLS = [
   'send_message',
   'interrupt_agent',
   'workflow',
-  'ralph',
   'subagent_fork',
   'todo_write',
 ]

@@ -84,15 +84,41 @@ function makeFakeLoader() {
   }
 }
 
-/** 假的 settings 服务：installSection 记下 hooks，测试用它模拟「用户在面板里保存」。 */
+/**
+ * 假的 settings 服务（0.2.0-rc.2 形态）。
+ *
+ * 旧版是 `installSection(owner, ns, schema, entry, hooks)` —— 那个 API 已从 DSH 删除，
+ * 行为断言因此改成「新形态」：插件只调 `configure({ auto: false }, owner)` 声明
+ * 「我自己有面板页，别按 schema 生成表单」；面板值本来就写在条目 config 里，
+ * 所以「用户在面板里保存」由夹具直接推进 volatile 引用再发
+ * `settings/document-updated` 模拟（见下面 T9~T11）。
+ */
 function makeFakeSettings() {
-  const sections = []
+  const calls = { configure: [] }
   return {
-    sections,
+    calls,
     service: {
-      installSection(owner, ns, schema, entry, hooks) {
-        sections.push({ ns, schema, entry, hooks })
+      configure(presentation, owner) {
+        calls.configure.push({ presentation, owner })
+        return () => {}
       },
+    },
+  }
+}
+
+/**
+ * 一个最小的 `Volatile` 桩：`get()` 读闭包里的可变量。
+ *
+ * 真实实现在 `@deepseek-ai/cosmokit`：loader 在 profile patch 被改写时**就地更新引用**
+ * （引用本身不变，`get()` 给出新值），这就是「面板保存后角色行立刻跟着变」的机制。
+ * 夹具用这个桩等价模拟：`set()` 代表 loader 那次就地更新。
+ */
+function volatileBox(value) {
+  const state = { value }
+  return {
+    get: () => state.value,
+    set: (next) => {
+      state.value = next
     },
   }
 }
@@ -130,17 +156,28 @@ function makeCtx(services = {}) {
   const handlers = new Map()
   const sections = []
   const loggerLines = []
+  const warnLines = []
   const injected = new Set()
   return {
     sections,
     loggerLines,
+    warnLines,
     injected,
     handler(name) {
       const list = handlers.get(name)
       return list === undefined ? undefined : list[0]
     },
+    /** 触发某个事件的全部处理函数（Cordis 事件是广播，这里等价模拟）；返回处理函数个数。 */
+    emit(name, ...args) {
+      const list = handlers.get(name) ?? []
+      for (const handler of list) handler(...args)
+      return list.length
+    },
     ctx: {
-      logger: { info: (message) => loggerLines.push(String(message)), warn: () => {} },
+      logger: { info: (message) => loggerLines.push(String(message)), warn: (message) => warnLines.push(String(message)) },
+      // 真实 Cordis 的每个 ctx 都带 fiber：插件用 `settings.configure(policy, ctx.fiber)`
+      // 把「自带面板页」这条策略挂到自己的插件实例上，夹具必须能看见它。
+      fiber: { uid: 'fixture-fiber' },
       systemPrompt: {
         section: (section) => {
           sections.push(section)
@@ -165,7 +202,21 @@ function makeCtx(services = {}) {
         if (ready) {
           // 注入面同时带 get：宿主代码在请求时用 serverCtx.get('llm') 读模型目录，
           // 与真实 Cordis 注入面一致；缺席时返回 undefined，插件必须降级而非抛错。
-          const injectedCtx = { ...available, effect: (fn) => fn(), settings: available.settings, webServer: available.webServer, get: (name) => services[name] }
+          // `on` 也必须有：真实注入面是个子 ctx，事件注册就发生在它上面
+          // （插件用 `settingsCtx.on('settings/document-updated', …)` 收配置变更）。
+          const injectedCtx = {
+            ...available,
+            effect: (fn) => fn(),
+            settings: available.settings,
+            webServer: available.webServer,
+            on: (name, handler) => {
+              const list = handlers.get(name)
+              if (list === undefined) handlers.set(name, [handler])
+              else list.push(handler)
+              return () => {}
+            },
+            get: (name) => services[name],
+          }
           // cordis 注入面同时是 ctx 属性：声明 inject 的服务按属性访问（官方 open-in-app 亦如此）。
           if (available.connection !== undefined) injectedCtx.connection = available.connection
           callback(injectedCtx)
@@ -315,7 +366,7 @@ console.log('\nT6 轮次结束告警')
   check('产生一次 steering', steered.length === 1, `steered=${steered.length}`)
   const text = steered[0]?.content?.map((b) => b.text).join('') ?? ''
   check('告警列出文件名', text.includes('alpha.txt') && text.includes('beta.txt'), text)
-  check('消息来源标记为插件', steered[0]?.source?.kind === 'plugin' && steered[0]?.source?.plugin === 'collab-mode', JSON.stringify(steered[0]?.source))
+  check('消息来源标记为插件', steered[0]?.source?.kind === 'plugin:collab-mode', JSON.stringify(steered[0]?.source))
 
   await stopping({ agent, turn: 8, signal })
   check('同一组未声明文件不重复告警', steered.length === 1, `steered=${steered.length}`)
@@ -371,50 +422,101 @@ async function verifyPanelMechanism() {
     webServer: webServer.service,
     connection: trustFence.service,
   })
-  apply(panelCtx.ctx, { logDir: join(root, 'logs2') })
-  // installSection 是在 inject 回调里注册的；夹具的 inject 会同步回调，因此这里已就绪。
+  // 条目 config：volatile 字段是引用（真实由 loader 就地更新，夹具用 volatileBox 模拟）。
+  // 这正是 0.2.0-rc.2 的形态 —— 面板可写字段标 `.volatile()`，apply 收到 `{ get() }`。
+  const boxes = {
+    routes: volatileBox({}),
+    gate: volatileBox(true),
+    audit: volatileBox(true),
+    warnOnTurnEnd: volatileBox(true),
+    declarationThreshold: volatileBox(3),
+    logDir: volatileBox(join(root, 'logs2')),
+    dockCardVisible: volatileBox(true),
+    dockRows: volatileBox(8),
+    dockFold: volatileBox(3),
+    dockColumns: volatileBox({}),
+    roleColors: volatileBox({}),
+  }
+  apply(panelCtx.ctx, { ...boxes, rulesSection: 'collab-mode:rules', rulesOrder: 400 })
+  // settings.configure 与 document-updated 订阅都在 inject 回调里注册；夹具的 inject 同步回调。
   await new Promise((resolve) => setTimeout(resolve, 0))
 
-  check('注册了 collab-mode 设置命名空间', settings.sections.length === 1 && settings.sections[0].ns === 'collab-mode', JSON.stringify(settings.sections.map((s) => s.ns)))
-
-  // T9：七个角色行由插件用 loader.create 创建（不是补丁 insert）。
-  // advisor 一份源拆三席（advisor-A/B/C），因此行 id 是 collab-advisor-A/B/C。
-  const ids = loader.calls.create.slice().sort()
-  check('用 loader.create 建了 7 行', ids.length === 7, JSON.stringify(ids))
   check(
-    '行 id 与展开后的角色 key 同名',
-    ids.join(',') ===
+    '调了 settings.configure（自带面板页 → auto:false）',
+    settings.calls.configure.length === 1 && settings.calls.configure[0].presentation?.auto === false,
+    JSON.stringify(settings.calls.configure),
+  )
+  check('configure 的策略挂在本插件 fiber 上', settings.calls.configure[0]?.owner === panelCtx.ctx.fiber, String(settings.calls.configure[0]?.owner))
+
+  // T9：7 个角色行 + 7 个专属 spawn provider 行（provider 名 = 角色标识），
+  // 全部由插件用 loader.create 创建（不是补丁 insert）。
+  // advisor 一份源拆三席（advisor-A/B/C），因此行 id 是 collab-advisor-A/B/C。
+  const createdIds = loader.calls.create.slice()
+  const providerIds = createdIds.filter((id) => id.startsWith('collab-provider-'))
+  const roleIds = createdIds.filter((id) => !id.startsWith('collab-provider-'))
+  check('用 loader.create 建了 7 个 provider 行', providerIds.length === 7, JSON.stringify(providerIds))
+  check(
+    '用 loader.create 建了 7 个角色行',
+    roleIds.slice().sort().join(',') ===
       'collab-advisor-A,collab-advisor-B,collab-advisor-C,collab-code-reviewer,collab-executor,collab-researcher,collab-vision-reader',
-    ids.join(','),
+    JSON.stringify(roleIds),
+  )
+  check(
+    'provider 行先于角色行创建（工具按 provider 名镜像注册）',
+    createdIds.lastIndexOf('collab-provider-vision-reader') < createdIds.indexOf('collab-executor'),
+    JSON.stringify(createdIds),
+  )
+  const execProviderRow = loader.entries.get('collab-provider-executor')
+  check(
+    'executor provider 行是 spawn 实现、注册名专属',
+    execProviderRow?.options?.name === '@deepseek-ai/dsh-subagent-spawn-in-process' &&
+      execProviderRow?.options?.config?.providerName === 'collab-spawn-executor',
+    JSON.stringify(execProviderRow?.options),
   )
   const executorRow = loader.entries.get('collab-executor')
   check('executor 行 name 是 dsh-tool-subagent', executorRow?.options?.name === '@deepseek-ai/dsh-tool-subagent', executorRow?.options?.name)
   check('executor 行 toolName 是 executor', executorRow?.options?.config?.toolName === 'executor', executorRow?.options?.config?.toolName)
-  check('executor 行无 toolFilter（可写）', executorRow?.options?.config?.toolFilter === undefined, JSON.stringify(executorRow?.options?.config?.toolFilter))
-  check('executor 行带 persona', typeof executorRow?.options?.config?.persona === 'string' && executorRow.options.config.persona.length > 50)
+  check(
+    'executor 行不含 0.2.1 已删字段（persona/toolFilter/backgroundMode）',
+    executorRow?.options?.config?.persona === undefined &&
+      executorRow?.options?.config?.toolFilter === undefined &&
+      executorRow?.options?.config?.backgroundMode === undefined,
+    JSON.stringify(executorRow?.options?.config),
+  )
+  check(
+    'executor 行 provider / toolName / maxDepth 正确',
+    executorRow?.options?.config?.provider === 'collab-spawn-executor' &&
+      executorRow?.options?.config?.toolName === 'executor' &&
+      executorRow?.options?.config?.maxDepth === 1,
+    JSON.stringify(executorRow?.options?.config),
+  )
   const reviewerRow = loader.entries.get('collab-code-reviewer')
-  check('只读行带 toolFilter.deny', Array.isArray(reviewerRow?.options?.config?.toolFilter?.deny) && reviewerRow.options.config.toolFilter.deny.length === 13, JSON.stringify(reviewerRow?.options?.config?.toolFilter))
+  check('只读行也不再带 toolFilter（改由子会话作用域 restrict）', reviewerRow?.options?.config?.toolFilter === undefined, JSON.stringify(reviewerRow?.options?.config?.toolFilter))
   check('默认不写 agentOptions（留空 = 继承会话）', executorRow?.options?.config?.agentOptions === undefined, JSON.stringify(executorRow?.options?.config?.agentOptions))
 
-  // T10：面板保存 → setSource/onChange → 角色行被 loader.update 改写。
-  const hooks = settings.sections[0].hooks
-  const panelValue = {
-    routes: {
-      executor: { provider: 'openai', model: 'gpt-5', reasoningEffort: 'high', maxTokens: 4096 },
-      'code-reviewer': { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
-      researcher: { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
-      'advisor-A': { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
-      'advisor-B': { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
-      'advisor-C': { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
-      'vision-reader': { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
-    },
-    gate: false,
-    audit: true,
-    warnOnTurnEnd: true,
-    declarationThreshold: 5,
-    logDir: '',
-  }
-  hooks.setSource(() => panelValue)
+  // T10：面板保存 → loader 就地更新 volatile 引用 → settings/document-updated
+  // → 插件重读并 loader.update 改写角色行。三步缺一不可，所以这里逐段推进：
+  //   ① 只改引用不发事件 —— 角色行**不该**变（证明我们靠事件驱动，不是靠轮询/时机）；
+  //   ② 发别的条目的事件 —— 也**不该**变（证明按 ns 过滤，别家插件改配置不会连坐我们）；
+  //   ③ 发自己的事件 —— 这时才改写。
+  boxes.routes.set({
+    executor: { provider: 'openai', model: 'gpt-5', reasoningEffort: 'high', maxTokens: 4096 },
+    'code-reviewer': { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
+    researcher: { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
+    'advisor-A': { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
+    'advisor-B': { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
+    'advisor-C': { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
+    'vision-reader': { provider: '', model: '', reasoningEffort: '', maxTokens: 0 },
+  })
+  boxes.gate.set(false)
+  boxes.declarationThreshold.set(5)
+  boxes.logDir.set('')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  check('只改引用不发事件时角色行不变（事件驱动，不是轮询）', loader.calls.update.length === 0, JSON.stringify(loader.calls.update.map((c) => c.id)))
+  panelCtx.emit('settings/document-updated', 'some-other-entry', 1)
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  check('别的条目的事件被 ns 过滤掉', loader.calls.update.length === 0, JSON.stringify(loader.calls.update.map((c) => c.id)))
+  panelCtx.emit('settings/document-updated', 'collab-mode', 2)
   await new Promise((resolve) => setTimeout(resolve, 0))
 
   const executorUpdate = loader.calls.update.filter((c) => c.id === 'collab-executor').pop()
@@ -423,8 +525,9 @@ async function verifyPanelMechanism() {
   check('改写后的 agentOptions.model 正确', executorUpdate?.options?.config?.agentOptions?.model === 'gpt-5')
   check('改写后的 agentOptions.reasoningEffort 正确', executorUpdate?.options?.config?.agentOptions?.reasoningEffort === 'high')
   check('改写后的 agentOptions.maxTokens 正确', executorUpdate?.options?.config?.agentOptions?.maxTokens === 4096)
-  check('改写后仍保留 persona', typeof executorUpdate?.options?.config?.persona === 'string' && executorUpdate.options.config.persona.length > 50)
+  check('改写后不重新带上已删字段', executorUpdate?.options?.config?.persona === undefined && executorUpdate?.options?.config?.toolFilter === undefined, JSON.stringify(executorUpdate?.options?.config))
   check('留空的角色行不被改写', loader.calls.update.filter((c) => c.id.startsWith('collab-advisor-')).length === 0, JSON.stringify(loader.calls.update.map((c) => c.id)))
+  check('面板事件不会重建 provider/角色行（同步幂等）', loader.calls.create.length === 14, String(loader.calls.create.length))
 
   // 面板关掉 gate → 拦截不再发生。
   const prePanel = panelCtx.handler('tools/pre-execute')
@@ -441,10 +544,10 @@ async function verifyPanelMechanism() {
   check('gate=false 时连改 4 个未声明文件都不 deny', denied === 0, `denied=${denied}`)
 
   // 再打开 gate（并把阈值调回 3）→ 第 3 次改回被 deny。
-  hooks.onChange()
-  panelValue.gate = true
-  panelValue.declarationThreshold = 3
-  hooks.setSource(() => panelValue)
+  // 同样走「就地更新引用 + 事件」两步：这也是真实面板保存的路径。
+  boxes.gate.set(true)
+  boxes.declarationThreshold.set(3)
+  panelCtx.emit('settings/document-updated', 'collab-mode', 3)
   await new Promise((resolve) => setTimeout(resolve, 0))
   const gateAgent = makeAgent('session-panel-gate-on')
   let deniedOn = 0
@@ -503,7 +606,7 @@ async function verifyPanelMechanism() {
     apply(bareCtx.ctx, { logDir: join(root, 'logs3') })
     const bareRoute = bare.routes.find((r) => r.path === '/api/collab-mode/selfcheck')
     check('缺 connection 时路由不注册（硬依赖等待）', bareRoute === undefined, JSON.stringify(bare.routes.map((r) => r.path)))
-    check('缺 connection 时仍注册了设置命名空间', bareSettings.sections.length === 1, String(bareSettings.sections.length))
+    check('缺 connection 时仍声明了自带面板页（configure 被调）', bareSettings.calls.configure.length === 1, JSON.stringify(bareSettings.calls.configure))
   }
 
   // 栅栏返回 401 → 必须 401，且不泄漏自检数据。
@@ -545,6 +648,22 @@ async function verifyPanelMechanism() {
 }
 
 await verifyPanelMechanism()
+
+/* ---- T9b：没有 settings 也要有七个角色工具（v0.1.0 行为，0.2.0 移植后必须继续成立） ---- */
+console.log('\nT9b 无 settings 服务时的降级路径')
+async function verifyNoSettingsFallback() {
+  const loader = makeFakeLoader()
+  const bareCtx = makeCtx({ loader: loader.service })
+  // 只有 loader、没有 settings：插件必须用 schema 默认值把七个角色行建出来。
+  bareCtx.ctx.logger.info = (message) => bareCtx.loggerLines.push(String(message))
+  apply(bareCtx.ctx, { logDir: join(root, 'logs5') })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  check('settings 缺席时仍建了 7 个 provider + 7 个角色行', loader.calls.create.length === 14, JSON.stringify(loader.calls.create))
+  check('settings 缺席时不改行（没有面板值要写）', loader.calls.update.length === 0, JSON.stringify(loader.calls.update.map((c) => c.id)))
+  check('settings 缺席时插件照常装载（active 日志已打印）', bareCtx.loggerLines.some((line) => line.includes('collab-mode: active')), JSON.stringify(bareCtx.loggerLines))
+}
+
+await verifyNoSettingsFallback()
 
 /* ---- T12b：模型目录（编辑页"模型"下拉的数据源，best-effort 只读） ---- */
 console.log('\nT12b 模型目录')
@@ -592,6 +711,266 @@ async function verifyModelCatalog() {
 }
 
 await verifyModelCatalog()
+
+/* ---- T12b2：0.2.1 子会话作用域装配（人设覆盖 / 只读 restrict / 异步收口） ---- */
+console.log('\nT12b2 子会话作用域装配与异步委派生命周期')
+
+/**
+ * 子会话作用域的桩：section / restrict / guard 三个注册面都记下来。
+ *
+ * ⚠ `get(name, scope)` **必须带 scope 才返回工具**：真实 dsh-tools 省略 scope 时是
+ * global view，而标准预设的工具注册在 preset scope —— 夹具必须能抓住这个错。
+ */
+function makeChildCtx(toolMode) {
+  const sections = []
+  const restrictions = []
+  const guards = []
+  const scopesSeen = []
+  const tools = {
+    get: (name, scope) => {
+      scopesSeen.push(scope)
+      return toolMode === 'all' && scope !== undefined ? { name } : undefined
+    },
+    restrict: (filter) => {
+      restrictions.push(filter)
+      return () => {}
+    },
+    guard: (fn) => {
+      guards.push(fn)
+      return () => {}
+    },
+  }
+  const systemPrompt = {
+    section: (section) => {
+      sections.push(section)
+      return () => {}
+    },
+  }
+  const childCtx = {
+    sections,
+    restrictions,
+    guards,
+    scopesSeen,
+    effect: (fn) => {
+      fn()
+      return () => {}
+    },
+    get: (name) => (name === 'tools' ? tools : name === 'systemPrompt' ? systemPrompt : undefined),
+    tools,
+    systemPrompt,
+  }
+  return childCtx
+}
+
+function makeChildAgent(id, parent, childCtx) {
+  return {
+    id,
+    session: { header: { id, parentSession: parent, origin: 'subagent', delegationDepth: 1, cwd: project } },
+    ctx: childCtx,
+  }
+}
+
+async function verifySubagentScope() {
+  const webServer = makeFakeWebServer()
+  const trustFence = makeFakeTrustFence()
+  // 子会话注册表：subagent/start 只带 id，装配时按 id 取回 Agent。
+  const children = new Map()
+  const agents = { get: (id) => children.get(id) }
+  const h = makeCtx({ webServer: webServer.service, connection: trustFence.service, agents })
+  apply(h.ctx, { logDir: join(root, 'logs6') })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+
+  const preH = h.handler('tools/pre-execute')
+  const postH = h.handler('tools/post-execute')
+  const next = async () => ({ kind: 'allow' })
+  const parent = makeAgent('session-parent-scope')
+  const route = webServer.routes.find((r) => r.path === '/api/collab-mode/selfcheck')
+  const snapshot = async () => {
+    const state = { statusCode: 0, body: undefined }
+    await route.handler({ method: 'GET', url: '/api/collab-mode/selfcheck', headers: {} }, {
+      get statusCode() { return state.statusCode },
+      set statusCode(value) { state.statusCode = value },
+      setHeader: () => {},
+      end: (body) => { state.body = body },
+    })
+    return JSON.parse(String(state.body)).value
+  }
+
+  // 并发发起两个角色委派：0.2.1 的角色工具是 parallel-safe，创建顺序不保证。
+  const execCall = {
+    callId: 'scope-exec-1',
+    name: 'executor',
+    arguments: { description: '执行任务', prompt: '按简报改' },
+    agent: parent,
+    signal,
+  }
+  const reviewCall = {
+    callId: 'scope-rev-1',
+    name: 'code-reviewer',
+    arguments: { description: '审查', prompt: '看改动' },
+    agent: parent,
+    signal,
+  }
+  await Promise.all([preH(execCall, next), preH(reviewCall, next)])
+
+  const execCtx = makeChildCtx('all')
+  const reviewCtx = makeChildCtx('all')
+  children.set('child-exec-1', makeChildAgent('child-exec-1', 'session-parent-scope', execCtx))
+  children.set('child-rev-1', makeChildAgent('child-rev-1', 'session-parent-scope', reviewCtx))
+  // 故意逆序发 start：认领靠 provider 名，不靠创建顺序。
+  h.emit('subagent/start', { id: 'child-rev-1', provider: 'collab-spawn-code-reviewer', local: true })
+  h.emit('subagent/start', { id: 'child-exec-1', provider: 'collab-spawn-executor', local: true })
+
+  check(
+    'executor 子会话收到 persona 覆盖（同名段）',
+    execCtx.sections.length === 1 && execCtx.sections[0].name === 'deployment:persona-prefix',
+    JSON.stringify(execCtx.sections.map((s) => s.name)),
+  )
+  check(
+    'executor persona 正文来自 ROLES',
+    execCtx.sections[0]?.text?.startsWith('你是协作流程里的 `executor`'),
+    String(execCtx.sections[0]?.text ?? '').slice(0, 40),
+  )
+  check('可写角色不装只读限制', execCtx.restrictions.length === 0 && execCtx.guards.length === 0, JSON.stringify({ r: execCtx.restrictions.length, g: execCtx.guards.length }))
+  check(
+    '逆序创建也不串：reviewer 拿到自己的 persona',
+    reviewCtx.sections.length === 1 && reviewCtx.sections[0].text.startsWith('你是协作流程里的 `code-reviewer`'),
+    String(reviewCtx.sections[0]?.text ?? '').slice(0, 40),
+  )
+  check(
+    '只读角色在子会话作用域装 restrict（12 项）',
+    reviewCtx.restrictions.length === 1 && reviewCtx.restrictions[0].deny.length === 12,
+    JSON.stringify(reviewCtx.restrictions),
+  )
+  check(
+    'restrict 名单含 edit / write',
+    Array.isArray(reviewCtx.restrictions[0]?.deny) &&
+      reviewCtx.restrictions[0].deny.includes('edit') &&
+      reviewCtx.restrictions[0].deny.includes('write'),
+    JSON.stringify(reviewCtx.restrictions[0]?.deny),
+  )
+  check(
+    '可见性探测带子会话 scope（省略 scope 会把预设工具误判为不可见）',
+    reviewCtx.scopesSeen.length > 0 && reviewCtx.scopesSeen.every((scope) => scope !== undefined),
+    JSON.stringify(reviewCtx.scopesSeen.map((scope) => (scope === undefined ? 'undefined' : typeof scope))),
+  )
+
+  // 非角色 provider（通用 subagent / fork）不得被误装。
+  const plainCtx = makeChildCtx('all')
+  children.set('child-plain-1', makeChildAgent('child-plain-1', 'session-parent-scope', plainCtx))
+  h.emit('subagent/start', { id: 'child-plain-1', provider: 'spawn', local: true })
+  check('非角色 provider 不装作用域', plainCtx.sections.length === 0 && plainCtx.restrictions.length === 0, JSON.stringify({ s: plainCtx.sections.length, r: plainCtx.restrictions.length }))
+
+  // 名单里的工具在这台机器上不可见时：restrict 会整单拒绝，必须退化为执行期 guard。
+  const researchCall = {
+    callId: 'scope-res-1',
+    name: 'researcher',
+    arguments: { description: '调研', prompt: '查资料' },
+    agent: parent,
+    signal,
+  }
+  await preH(researchCall, next)
+  const researchCtx = makeChildCtx('none')
+  children.set('child-res-1', makeChildAgent('child-res-1', 'session-parent-scope', researchCtx))
+  h.emit('subagent/start', { id: 'child-res-1', provider: 'collab-spawn-researcher', local: true })
+  check(
+    '工具名不可见时退化为执行期 guard',
+    researchCtx.restrictions.length === 0 && researchCtx.guards.length === 1,
+    JSON.stringify({ r: researchCtx.restrictions.length, g: researchCtx.guards.length }),
+  )
+  check('guard 对写操作给出拒绝理由', typeof researchCtx.guards[0]?.({ name: 'write' }) === 'string', String(researchCtx.guards[0]?.({ name: 'write' })))
+  check('guard 对只读工具放行', researchCtx.guards[0]?.({ name: 'read' }) === undefined, String(researchCtx.guards[0]?.({ name: 'read' })))
+
+  // ---- 异步委派生命周期（单独父会话，保证 claimRun 唯一认领） ----
+  const lifeParent = makeAgent('session-parent-life')
+  const lifeCall = {
+    callId: 'scope-life-1',
+    name: 'executor',
+    arguments: { description: '长任务', prompt: '慢慢做' },
+    agent: lifeParent,
+    signal,
+  }
+  await preH(lifeCall, next)
+  const lifeCtx = makeChildCtx('all')
+  children.set('child-life-1', makeChildAgent('child-life-1', 'session-parent-life', lifeCtx))
+  h.emit('subagent/start', { id: 'child-life-1', provider: 'collab-spawn-executor', local: true })
+  // 子会话事件把运行行绑到子会话 id（0.6.0 的 claimRun 路径）。
+  h.emit('session/event', { header: { id: 'child-life-1', parentSession: 'session-parent-life' } }, { type: 'user/message', data: { content: [{ type: 'text', text: '慢慢做' }] } })
+  await postH(lifeCall, { isError: false, content: [{ type: 'text', text: 'started subagent child-life-1' }] }, next)
+  const beforeEnd = await snapshot()
+  const runningRow = (beforeEnd.runs ?? []).find((row) => row.callId === 'scope-life-1')
+  check('post-execute 成功不结束行（异步委派）', runningRow !== undefined && runningRow.running === true, JSON.stringify(runningRow))
+  check('运行行由 claimRun 绑到子会话 id', runningRow?.childSid === 'child-life-1', String(runningRow?.childSid))
+  h.emit('subagent/end', { id: 'child-life-1', stopReason: 'completed' })
+  const afterEnd = await snapshot()
+  const endedRow = (afterEnd.runs ?? []).find((row) => row.callId === 'scope-life-1')
+  check('subagent/end 收口且 ok', endedRow !== undefined && endedRow.running === false && endedRow.ok === true, JSON.stringify(endedRow))
+
+  const failCall = {
+    callId: 'scope-fail-1',
+    name: 'code-reviewer',
+    arguments: { description: '审查', prompt: '看' },
+    agent: lifeParent,
+    signal,
+  }
+  await preH(failCall, next)
+  await postH(failCall, { isError: true, content: [] }, next)
+  const failedRow = (await snapshot()).runs?.find((row) => row.callId === 'scope-fail-1')
+  check('启动失败立即结束且 ok=false', failedRow !== undefined && failedRow.running === false && failedRow.ok === false, JSON.stringify(failedRow))
+}
+
+await verifySubagentScope()
+
+/* ---- T12b3：provider 行失败日志的聚合（同一原因不刷 7 行） ---- */
+console.log('\nT12b3 provider 行失败日志聚合')
+
+async function applyWithFailingProviders(messageFor) {
+  const harness = makeCtx({
+    loader: {
+      resolve() {
+        throw new Error('cannot resolve entry')
+      },
+      async create(options) {
+        throw new Error(messageFor(options.id))
+      },
+      async update() {},
+      write() {},
+    },
+  })
+  apply(harness.ctx, { logDir: join(root, 'logs7') })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  return harness.warnLines.filter((line) => line.includes('provider'))
+}
+
+{
+  // 同一个原因（典型：spawn 包没装）→ 合并成一条，带角色数。
+  const same = await applyWithFailingProviders(() => 'Cannot find package @deepseek-ai/dsh-subagent-spawn-in-process')
+  check(
+    '同一原因只打一条聚合警告',
+    same.filter((line) => line.includes('provider 行全部失败（同一原因）')).length === 1,
+    JSON.stringify(same),
+  )
+  check('聚合警告带角色数（7）', same.some((line) => line.includes('7 条 provider 行')), JSON.stringify(same))
+  check(
+    '不再逐行刷 provider 失败',
+    same.filter((line) => line.includes('provider row "')).length === 0,
+    JSON.stringify(same),
+  )
+
+  // 原因各不相同 → 仍逐行打印，不合并。
+  const mixed = await applyWithFailingProviders((id) => `boom ${id}`)
+  check(
+    '不同原因仍逐行打印（7 条）',
+    mixed.filter((line) => line.includes('provider row "')).length === 7,
+    JSON.stringify(mixed),
+  )
+  check(
+    '不同原因不产生聚合警告',
+    mixed.filter((line) => line.includes('provider 行全部失败')).length === 0,
+    JSON.stringify(mixed),
+  )
+}
+
 
 /* ---- T12c：模型档位（编辑页"推理强度"下拉的数据源，跟随模型） ---- */
 console.log('\nT12c 模型档位')
@@ -672,8 +1051,8 @@ async function verifyModelEfforts() {
 
 await verifyModelEfforts()
 
-/* ---- T13：客户端半侧防线（v0.2.1 补） ---- */
-console.log('\nT13 客户端半侧：settingsScope 必须是声明依赖')
+/* ---- T13：客户端半侧防线（v0.2.1 补；0.2.0-rc.2 移植后换了 API） ---- */
+console.log('\nT13 客户端半侧：inject 名字必须可解析 + 设置表单走 configForms')
 
 /**
  * 加载 `lib/client.js`。
@@ -721,25 +1100,62 @@ async function verifyClientHalf() {
 
   check('客户端 inject 是数组', Array.isArray(client.inject), JSON.stringify(client.inject))
   check('客户端 inject 含 slots', names.includes('slots'), JSON.stringify(names))
-  // 这条就是 v0.2.0 面板不可编辑的回归断言：
-  // settingsScope 必须出现在 inject 里，否则服务晚于本插件就绪时 Cordis 不会重评估 fiber。
-  check('客户端 inject 含 settingsScope（v0.2.0 缺陷回归）', names.includes('settingsScope'), JSON.stringify(names))
+  // 0.2.0-rc.2 的改名回归：客户端设置服务由旧的 scope 服务换成了 configForms。
+  // 名字写错**不会报错** —— 条目会永久 pending（桌面端判定致命、应用拒绝启动），
+  // 所以这里既断言新名字在，也断言旧名字一个都不剩（含注释，见下面的 source 检查）。
+  check('客户端 inject 含 configForms（0.2.0 改名回归）', names.includes('configForms'), JSON.stringify(names))
+  // 硬依赖只允许这两个：多一个就多一份「服务缺席 → 整个客户端条目 parking」的致命风险，
+  // 其余可选面（dock / 右栏 / 跳转）一律走 `ctx.inject(...)` 软依赖。
+  check(
+    '客户端 inject 恰好是 slots + configForms',
+    names.length === 2 && names.slice().sort().join(',') === 'configForms,slots',
+    JSON.stringify(names),
+  )
 
   const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
-  check("apply 不再用 ctx.get('settingsScope') 一次性读取", !source.includes("ctx.get('settingsScope')"), 'still present')
-  check('apply 直接使用注入的 ctx.settingsScope', source.includes('ctx.settingsScope.bind('), 'not found')
+  check('client.js 不再出现 settingsScope（含注释）', !source.includes('settingsScope'), 'still present')
+  // 0.2.0 删掉的三个旧 sessions 方法（旧名只写在这里，client.js 里一个都不许剩）：
+  //   openSubagent / refreshSubagents / navigationAddress
+  // 替代：uiWorkspace.openSession / sessions.refreshProjections / sessions.subagentAddress。
+  check(
+    'client.js 不再出现 openSubagent / refreshSubagents / navigationAddress',
+    !source.includes('openSubagent') && !source.includes('refreshSubagents') && !source.includes('navigationAddress'),
+    'legacy session API still present',
+  )
+  check('跳转改用 uiWorkspace.openSession', source.includes("rootCtx.get('uiWorkspace')") && source.includes('workspace.openSession('), 'not found')
+  check('跳转前用 refreshProjections 刷新投影', source.includes('sessions.refreshProjections('), 'not found')
+  check('写入失败看返回值（mutate 返回 boolean）', source.includes('if (accepted !== true)') && source.includes('SAVE_REFUSED'), 'not found')
+  check('右栏 guide 胶囊带 id（0.2.0 必填）', /guide:\s*\[\s*\{\s*id:\s*RUNS_TAB_ID/.test(source), 'not found')
+  check('设置导航包在 whileServed 里', source.includes('ctx.configForms.whileServed([NS]'), 'not found')
 
-  // 行为断言：给一个含 settingsScope 的 ctx，卡片必须拿到绑定的 scope 而不是 null。
+  // 行为断言：给一个 0.2.0 形态的 ctx（configForms + effect），卡片必须拿到本条目
+  // 的表单对象而不是 null；导航只在宿主服务该条目时才注册（whileServed 的语义）。
   const slotsRegistrations = []
-  let bound = null
+  const form = {
+    getSnapshot: () => ({ status: 'ready', value: {}, writable: true, revision: 1 }),
+    subscribe: () => () => {},
+    mutate: async () => true,
+    set: async () => true,
+    unset: async () => true,
+  }
+  const gotEntryIds = []
+  const servedWatches = []
   const ctx = {
     logger: { warn: () => {}, info: () => {} },
-    settingsScope: {
-      bind(spec) {
-        bound = spec
-        return { getSnapshot: () => ({ status: 'ready', value: {}, writable: true, revision: 1 }), subscribe: () => () => {}, mutate: async () => {}, set: async () => {}, unset: async () => {} }
+    // 注意：这个桩**故意不提供** `ctx.inject` —— 三个可选面（dock / 右栏 / 跳转）
+    // 因此整段不跑，下面「恰好一个槽位注册」的断言才干净；软依赖本身不是本用例的对象。
+    configForms: {
+      get(entryId) {
+        gotEntryIds.push(entryId)
+        return form
+      },
+      whileServed(namespaces, register) {
+        servedWatches.push(namespaces)
+        // 真实实现：等 describe 镜像里出现该条目才跑 register；夹具直接当作已服务。
+        return register(new Set(namespaces))
       },
     },
+    effect: (fn) => fn(),
     slots: {
       inject: (name, callback) => {
         callback()
@@ -753,7 +1169,8 @@ async function verifyClientHalf() {
   }
   client.apply(ctx)
 
-  check('bind 用命名空间 collab-mode', bound !== null && bound.namespace === 'collab-mode', JSON.stringify(bound))
+  check('configForms.get 收到的实参是条目 id collab-mode', gotEntryIds.length === 1 && gotEntryIds[0] === 'collab-mode', JSON.stringify(gotEntryIds))
+  check('whileServed 盯的是本条目', servedWatches.length === 1 && servedWatches[0].join(',') === 'collab-mode', JSON.stringify(servedWatches))
   check('注册了 settings.section 独立导航', slotsRegistrations.length === 1 && slotsRegistrations[0]?.options?.name === 'settings.section', JSON.stringify(slotsRegistrations.map((r) => r.options?.name)))
   const card = slotsRegistrations[0]
   check('section id 是 collab-mode', card.options.id === 'collab-mode', String(card.options.id))
@@ -762,8 +1179,9 @@ async function verifyClientHalf() {
   check('不再注册 settings.plugin.item', slotsRegistrations.every((r) => r.options?.name !== 'settings.plugin.item'), JSON.stringify(slotsRegistrations.map((r) => r.options?.name)))
 
   const injected = card.options.inject()
-  check('卡片拿到的 scope 不是 null（v0.2.0 缺陷回归）', injected.scope !== null && injected.scope !== undefined, String(injected.scope))
-  check('卡片拿到的 scope 可用', injected.scope.getSnapshot().status === 'ready', JSON.stringify(injected.scope.getSnapshot()))
+  check('卡片拿到的表单不是 null（0.2.0 改名回归）', injected.scope !== null && injected.scope !== undefined, String(injected.scope))
+  check('卡片拿到的表单就是 configForms.get 那一个', injected.scope === form, String(injected.scope))
+  check('卡片拿到的表单可用', injected.scope.getSnapshot().status === 'ready', JSON.stringify(injected.scope.getSnapshot()))
   check('注册时标记 section 视图', injected.asSection === true, JSON.stringify(injected.asSection))
 
   // 两视图静态标记（ZCode 子智能体页同款结构；行为要 React + DOM，走活体验证）。

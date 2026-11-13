@@ -20,20 +20,27 @@
  *     回退静态全集）+ maxTokens 可改，保存只写当前行；不做新建/删除/启用开关。
  *
  * 两份账本都齐才会渲染：
- *   Host 侧注册了 `collab-mode` 命名空间（见 lib/index.js 的 installSection），
+ *   Host 侧本条目声明了可编辑字段（lib/index.js 导出的 `Config` 里那批 `.volatile()`），
  *   浏览器侧在 `settings.section` 上注册 id 为 collab-mode 的导航。
  * 任一缺失时对应位置什么都不渲染 —— 所以本卡片的「找不到条目」降级文案是
  * 卡片自己内部的可读提示，而不是指望外壳兜底。
  *
  * 数据通道：
- *   A/B 区块的读写走原生 client settings scope（`ctx.settingsScope.bind`），
- *   不经过自建 HTTP bridge —— 与 dsh-free-search 的取舍不同，那个插件写于
- *   settingsScope 可用之前。C 区块的运行时自检走宿主侧的一条只读路由
+ *   A/B 区块的读写走**客户端设置表单服务** `ctx.configForms`：
+ *   `ctx.configForms.get(entryId)` 取本条目（entryId = 宿主组合条目 id，即 `collab-mode`）
+ *   的 ConfigForm，`getSnapshot` / `subscribe` / `mutate` 三件套照旧。0.1.x 那个
+ *   「按命名空间 bind 出 scope」的客户端设置服务已经删了（连同客户端包
+ *   `@deepseek-ai/dsh-client-runtime`；确切旧名记在 lib/index.js 顶部的移植说明里）——
+ *   inject 里写旧名字的后果**不是报错**，是条目**永久 pending**：桌面端把它当致命错误
+ *   （应用拒绝启动），网页端只渲染 `web boot: 1 entry did not activate`。
+ *   C 区块的运行时自检走宿主侧的一条只读路由
  *   `/api/collab-mode/selfcheck`（Host 半侧用 webServer.register 提供），
  *   自检 payload 里 roles[] 的描述/颜色/工具/人设全文只读字段与顶层的
  *   modelCatalog（可用供应商→模型目录，拿不到就 null）都只读，不可写回。
  *
- * 命名空间缺失/不可写仍由卡片内 `status !== 'ready'` 分支提示。
+ * 条目不可用（宿主没服务这个条目 / 连接是 memory 模式不可写）仍由卡片内
+ * `status !== 'ready'` 分支提示。非 loopback 页面没有持久化设置，表单以 `unavailable`
+ * 起步，那个分支正好覆盖它。
  *
  * 模块格式：客户端模块系统要求的 lazy-CJS factory（照 dsh-free-search/lib/client.js）。
  */
@@ -1008,26 +1015,47 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 跳转服务（官方子代理对话页只是一个入口，不自建页面）：照抄
-     * background-agents 的跳法 —— 先 refresh 再 open。`sessions` 是宿主核心面，
+     * 跳转服务（官方子代理对话页只是一个入口，不自建页面）。`sessions` 是宿主核心面，
      * 用软依赖等它；没到手时保持 null，按钮不渲染，整卡不受影响。
+     *
+     * ⚠ 0.2.0 换了方法名：旧版那三个（「打开子会话」「刷新子代理」「按 child id 查导航地址」）
+     * 在整棵 `@deepseek-ai` 树里命中 0 次 —— 全删了。官方替代写法（照抄
+     * `@deepseek-ai/dsh-client-ui-subagent/lib/client.js:949-962`）：
+     *   刷新投影 → `sessions.refreshProjections(parentSessionId)`
+     *   打开会话 → `uiWorkspace.openSession(address)`（`SessionTarget` 收 SubagentAddress）
+     *   地址     → `sessions.subagentAddress(childSessionId)`，拿不到就自组
+     *              `{ parentSessionId, childSessionId, mode }`
+     * 认服务的判据也跟着换成新方法名，免得收下一个「长得像但调不动」的对象。
+     * （三个旧方法的确切拼写记在 tests/verify-plugin.mjs 的 T13 —— 那里有「不许再出现」
+     * 的机械断言，谁能改这里的措辞、谁就得同时想清楚那条断言。）
      */
     let sessionsSvc = null
     function takeSessionsService(candidate) {
       if (candidate !== null && typeof candidate === 'object'
-        && typeof candidate.openSubagent === 'function'
-        && typeof candidate.refreshSubagents === 'function') {
+        && typeof candidate.refreshProjections === 'function'
+        && typeof candidate.subagentAddress === 'function') {
         sessionsSvc = candidate
       }
     }
 
     /**
-     * 跳进子会话对话页。候选地址按顺序试（宿主 `selectSubagent` 要求 mode 与
-     * 在册条目逐字相等，猜错就抛 —— 但抛在落子之前，无副作用，可放心连试）：
-     *  1. `navigationAddress`：从已加载目录按 child id 导出，mode 是条目自己的，最准；
-     *  2. `subagentAddress`：之前导航记住的 retained 地址；
-     *  3. 自组 one-shot（咱们的角色全是 one-shot 模式）；
-     *  4. 自组 continuable（抄 background-agents 的旧兜底，留作兼容）。
+     * 由 `apply` 灌进来的根 ctx：模块作用域里没有它，而导航服务要**点击时**才取。
+     * 为什么不把 `uiWorkspace` 写成硬依赖：少一个服务就让整个客户端条目 parking 的代价太大
+     * （桌面端直接拒绝启动），而跳转按钮本来就是可选面。
+     */
+    let rootCtx = null
+
+    /** 导航服务（`uiWorkspace`）按需取，不缓存 —— 服务重挂后照样拿到当前那一个。 */
+    function workspaceService() {
+      const value = rootCtx !== null && typeof rootCtx.get === 'function' ? rootCtx.get('uiWorkspace') : undefined
+      return value !== null && value !== undefined && typeof value.openSession === 'function' ? value : null
+    }
+
+    /**
+     * 跳进子会话对话页。候选地址按顺序试：
+     *  1. `sessions.subagentAddress(childSid)`：已经发现过的直接父/子地址，mode 是条目自己的，最准；
+     *  2. 自组 one-shot（咱们的角色全是 one-shot 委派）；
+     *  3. 自组 continuable / unknown（兼容 persisted 下来的其他模式）。
      * 全失败就把原因写进按钮悬停（不再静默吞错，否则下次还得猜）。
      */
     async function openRun(run, event) {
@@ -1042,28 +1070,27 @@ window.__ModuleLoader__.load({
       try {
         const sessions = sessionsSvc
         if (sessions === null || typeof run.childSid !== 'string' || run.childSid === '') return
-        if (typeof run.sid === 'string' && run.sid !== '') await sessions.refreshSubagents(run.sid)
+        const workspace = workspaceService()
+        if (workspace === null) {
+          fail('导航服务（uiWorkspace）不可用，无法跳转')
+          return
+        }
+        // 先让控制端把投影刷一遍，再问地址 —— 刚委派出来的会话这时才在目录里。
+        if (typeof run.sid === 'string' && run.sid !== '') await sessions.refreshProjections(run.sid)
         const candidates = []
         try {
-          const derived = typeof sessions.navigationAddress === 'function' ? sessions.navigationAddress(run.childSid) : undefined
-          if (derived !== undefined && derived !== null) candidates.push(derived)
+          const found = sessions.subagentAddress(run.childSid)
+          if (found !== undefined && found !== null) candidates.push(found)
         } catch (ignored) {
           /* 目录没加载就下一个 */
         }
-        try {
-          const retained = typeof sessions.subagentAddress === 'function' ? sessions.subagentAddress(run.childSid) : undefined
-          if (retained !== undefined && retained !== null) candidates.push(retained)
-        } catch (ignored) {
-          /* 没记住就下一个 */
+        for (const mode of ['one-shot', 'continuable', 'unknown']) {
+          candidates.push({ parentSessionId: run.sid, childSessionId: run.childSid, mode })
         }
-        candidates.push(
-          { parentSessionId: run.sid, childSessionId: run.childSid, mode: 'one-shot' },
-          { parentSessionId: run.sid, childSessionId: run.childSid, mode: 'continuable' },
-        )
         let lastError = null
         for (const address of candidates) {
           try {
-            sessions.openSubagent(address)
+            workspace.openSession(address)
             return
           } catch (error) {
             lastError = error
@@ -1075,9 +1102,12 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** 该行能不能跳：内存行（有 childSid）且跳转服务已到，缺一不可。审计行无按钮。 */
+    /** 该行能不能跳：内存行（有 childSid）且跳转所需的两个服务都在，缺一不可。审计行无按钮。 */
     function canJump(run) {
-      return sessionsSvc !== null && typeof run.childSid === 'string' && run.childSid !== ''
+      return sessionsSvc !== null
+        && workspaceService() !== null
+        && typeof run.childSid === 'string'
+        && run.childSid !== ''
     }
 
     /** 跳转按钮（唯一的入口，整卡不可点，防误触）。 */
@@ -1585,6 +1615,17 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * 宿主拒绝写入时的统一文案。
+     *
+     * 新版 `mutate` 是**失败不抛异常**的：返回 `false` 表示宿主拒了或这次写入被跳过，
+     * 只有传输层失败才 reject。两种常见拒绝原因：① 卡片手里的 `revision` 已过期
+     * （别处改过这份配置，宿主要求先重读再写，防覆盖）② 某个字段被宿主 schema 拒
+     * （前端校验挡不住手改的 profile patch）。宿主拒了之后客户端表单自己会重读一次
+     * 宿主状态，所以这里说的「重试」是真能重试的。
+     */
+    const SAVE_REFUSED = '宿主拒绝了这次写入，配置未改动。可能这份配置在别处被改过 —— 请重试。'
+
     /** 「协作模式」卡片本体。section 路径下默认展开、静态标题（不折叠）。 */
     function CollabModeCard(props) {
       const { scope, asSection } = props
@@ -1700,7 +1741,12 @@ window.__ModuleLoader__.load({
           // 这时重渲染会把原因标红写在页脚、保存按钮转回禁用 —— 不再有「点了毫无反应」。
           if (draftInvalid(draft) !== null) return
           // revision 栅栏：卡片加载后被外部改过，这次保存会被拒绝，而不是覆盖新值。
-          await scope.mutate(opsFromDraft(draft), snapshot === null ? undefined : snapshot.revision)
+          // 拒绝是**返回值**不是异常（见 SAVE_REFUSED 的注释），所以必须看返回值。
+          const accepted = await scope.mutate(opsFromDraft(draft), snapshot === null ? undefined : snapshot.revision)
+          if (accepted !== true) {
+            setFailed(SAVE_REFUSED)
+            return
+          }
           setDirty(false)
           await refreshCheck()
         } catch (error) {
@@ -1724,7 +1770,12 @@ window.__ModuleLoader__.load({
           // 只写这一行：落盘后能标干净的也只有这一行。整份草稿标干净是错的 ——
           // 列表页改过的 B/C 开关、行数还挂在草稿里，那会让下面的跟随刷新拿快照
           // 把它们一起回滚掉（改动无声消失）。这里只把当前行排除在比对之外。
-          await scope.mutate(opsFromRole(rowKey, draft.routes[rowKey], draft.roleColors[rowKey]), snapshot === null ? undefined : snapshot.revision)
+          const accepted = await scope.mutate(opsFromRole(rowKey, draft.routes[rowKey], draft.roleColors[rowKey]), snapshot === null ? undefined : snapshot.revision)
+          if (accepted !== true) {
+            // 同上：宿主拒绝是返回值。草稿保持「未保存」，用户改完能直接重试。
+            setFailed(SAVE_REFUSED)
+            return
+          }
           setDirty(!draftIsSaved(draft, snapshot === null ? null : snapshot.value, rowKey))
           await refreshCheck()
         } catch (error) {
@@ -2141,7 +2192,7 @@ window.__ModuleLoader__.load({
             { className: 'dshcm-field' },
             h('span', { className: 'dshcm-label' }, '可用工具'),
             row.writable
-              ? h('p', { className: 'dshcm-note' }, '全部工具：可写角色不受 toolFilter 限制。')
+              ? h('p', { className: 'dshcm-note' }, '全部工具：可写角色不受只读限制。')
               : h(
                 'span',
                 { className: 'dshcm-rowTop' },
@@ -2149,7 +2200,7 @@ window.__ModuleLoader__.load({
                   ? deniedList.map((t) => h('span', { key: t, className: 'dshcm-tag dshcm-tagRo' }, t))
                   : [h('span', { key: 'unknown', className: 'dshcm-tag' }, '只读')]
                 )),
-            row.writable ? null : h('p', { className: 'dshcm-note' }, '以上工具被 toolFilter.deny 摘除，只读角色不可改。'),
+            row.writable ? null : h('p', { className: 'dshcm-note' }, '以上工具在只读角色的子会话里被 tools.restrict 摘除，不可改。'),
           ),
           h(
             'div',
@@ -2375,41 +2426,62 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 服务依赖。
+     * 服务依赖（模块级导出的 `inject` = 客户端条目的**硬依赖**）。
      *
-     * ⚠ `settingsScope` **必须**列在这里，不能靠 `ctx.get()` 一次性读取：
-     * Cordis 的 `ctx.get(name)` 不参与依赖等待（`ServiceRegistry.notify` 只对
-     * 出现在 `fiber.inject` 里的名字重评估 fiber）。服务若晚于本插件就绪，
-     * 一次性读取就永远拿到 `undefined`，卡片锁死在降级态 —— v0.2.0 的面板
-     * 不可编辑就是这个原因。
+     * ⚠ 这两个名字**必须**列在这里，不能靠 `ctx.get()` 一次性读取：
+     * Cordis 的 `ctx.get(name)` 不参与依赖等待（`ServiceRegistry.notify` 只对出现在
+     * `fiber.inject` 里的名字重评估 fiber）。服务若晚于本插件就绪，一次性读取就永远
+     * 拿到 `undefined`，卡片锁死在降级态 —— v0.2.0 的面板不可编辑就是这个原因。
      *
-     * 代价：`settingsScope` 缺席时整个客户端插件不加载、面板不出现。
-     * 保留 settingsScope 硬依赖，因为 scope.bind 仍需要它：命名空间级降级
-     * （宿主未服务该 ns / memory 模式不可写）仍由卡片内
-     * `status !== 'ready'` 分支给出可读原因。
+     * ⚠ 名字必须是**新版服务键**：客户端设置服务在 0.2.0-rc.2 改了名（`configForms`
+     * 取代了 0.1.x 的那个 scope 服务，旧名见 lib/index.js 顶部的移植说明）。这里写错
+     * 一个名字不会报错，条目会**永久 pending**：桌面端判定为致命错误（应用拒绝启动），
+     * 网页端只渲染 `web boot: 1 entry did not activate`。
+     *
+     * 代价：这两个服务缺席时整个客户端插件不加载、设置卡不出现。服务内部的
+     * 「条目级」降级（宿主没服务这个条目 / memory 模式不可写）仍由卡片内
+     * `status !== 'ready'` 分支给出可读原因，所以这里只压真正致命的那两个。
+     *
+     * ⚠ 其余服务（`slots` 之外的 dock / 右栏 / 跳转）一律走下面的软依赖
+     * `ctx.inject(...)`：那套语义是「服务到齐才跑这一段，到不了就整段不跑」，
+     * 正是可选面该有的行为。把它们也写成硬依赖，就等于「少一个服务 → 桌面端不启动」，
+     * 风险严格更大。
      */
-    const inject = ['slots', 'settingsScope']
+    const inject = ['slots', 'configForms']
 
     function apply(ctx) {
-      // inject 满足后 Cordis 才调 apply，此时服务必定可用。
-      const scope = ctx.settingsScope.bind({ namespace: NS })
+      // 模块作用域里没有 ctx，而跳转/导航要按需取服务（见 workspaceService）。
+      rootCtx = ctx
+      // inject 满足后 Cordis 才调 apply，此时两个硬依赖必定可用。
+      // `get(entryId)` 收的是**宿主组合条目 id**（cordis.patch.yml 里 `- id: collab-mode`），
+      // 不是命名空间名 —— 两者本插件恰好同值，但语义不同。
+      const scope = ctx.configForms.get(NS)
 
-      ctx.slots.inject('settings.section', () =>
-        ctx.slots.register(
-          {
-            name: 'settings.section',
-            id: 'collab-mode',
-            order: 79,
-            label: '协作模式',
-            inject: () => ({ scope, asSection: true }),
-          },
-          CollabModeCard,
-        ),
+      // 只在宿主确实服务这个条目时才注册导航：`whileServed` 等到 describe 镜像里
+      // 出现该条目才跑 register，条目消失（插件被停用/换 profile）时自动撤掉 ——
+      // 官方页面都是这么挂的（`dsh-client-ui-settings-web-search/lib/client.js:307`）。
+      // 外层 `ctx.effect` 拿回「停止观察 + 撤注册」的 disposer，模块卸载时不留残影。
+      ctx.effect(
+        () =>
+          ctx.configForms.whileServed([NS], () =>
+            ctx.slots.inject('settings.section', () =>
+              ctx.slots.register(
+                {
+                  name: 'settings.section',
+                  id: 'collab-mode',
+                  order: 79,
+                  label: '协作模式',
+                  inject: () => ({ scope, asSection: true }),
+                },
+                CollabModeCard,
+              ),
+            ),
+          ),
+        'collab-mode: settings section',
       )
 
-      // 软依赖注册：走 `ctx.inject`（离线夹具的 ctx 没有它，因此那里的「恰好一个
-      // 槽位注册」断言不受影响）。注册用外层 `ctx.slots`（`inject` 数组里的硬依赖，
-      // `apply` 跑起来时必定可用）。
+      // 软依赖注册：走 `ctx.inject`（离线夹具的 ctx 也有它）。这一段的服务都**可选**，
+      // 到不了就整段不跑，设置卡与角色行不受影响。
       if (typeof ctx.inject === 'function') {
         ctx.inject(['slots'], () => {
           // 输入框上方原位的运行卡（面板 C 区块的总开关控制整卡是否渲染）。
@@ -2424,6 +2496,10 @@ window.__ModuleLoader__.load({
           //      一个胶囊入口（没有它，右栏在没有 tab 时打开的是引导页，用户无从点进
           //      这个类型）。
           //   2. 正文与标题：两个 keyed 座位各注册一次，同键同体。
+          //
+          // ⚠ guide 数组里每一项的 `id` 在 0.2.0 是**必填**（tab-registry 的
+          // `SidebarRightGuideEntry`：「Stable entry identity within its provider」）——
+          // 漏了它胶囊拿不到身份，引导页入口静默消失。这里用与 tab 类型同一个 id。
           //
           // ⚠ 类型注册必须等 `sidebarRightTabs` 到位，不能直接用 `ctx.sidebarRightTabs`：
           // 该服务由 `@deepseek-ai/dsh-client-ui-sidebar-right` 在它自己的 apply 里
@@ -2447,6 +2523,7 @@ window.__ModuleLoader__.load({
                   title: () => RUNS_TAB_LABEL,
                   guide: [
                     {
+                      id: RUNS_TAB_ID,
                       order: 60,
                       title: () => RUNS_TAB_LABEL,
                       description: () => '本会话的子智能体运行行（与对话窗口运行卡同一份数据）',
@@ -2470,8 +2547,9 @@ window.__ModuleLoader__.load({
               RunsPaneTitle,
             ),
           )
-          // 跳转服务软依赖：sessions 是宿主核心面，到了就收下做按钮；不到（老版本）
-          // 整段跳过，行只少个按钮，其他照常。组件靠 2s 轮询重渲染，服务晚到也能补上。
+          // 跳转服务软依赖：sessions 是宿主核心面，到了就收下做按钮；不到（老版本 /
+          // 该包未装载）整段跳过，行只少个按钮，其他照常。组件靠 2s 轮询重渲染，
+          // 服务晚到也能补上。导航服务（uiWorkspace）不在这里等 —— 它在点击时按需取。
           ctx.inject(['sessions'], (sctx) => {
             const fromArg = sctx !== null && sctx !== undefined ? sctx.sessions : undefined
             takeSessionsService(fromArg)

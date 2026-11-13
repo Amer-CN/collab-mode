@@ -8,17 +8,30 @@
  *   2. 改动前拦截 `tools/pre-execute`：本会话未声明生产文件累计到阈值 → deny，并列出文件名。
  *   3. 审计 `tools/post-execute`：每次工具调用追加一行 JSON 日志（ts/sid/tool/target/ok/latency）。
  *   4. 轮次结束告警 `agent/turn-stopping`：有未声明改动 → 通过 `agent.steer` 告警并列出文件名；否则静默。
- *   5. 子智能体运行列表：同一对工具钩子顺手记下七个角色的起止与真实 provider/model，
- *      折叠成只读列表经自检路由给对话窗口的 dock 卡与右栏竖列（对话转录不注入任何进度行）。
+ *   5. 子智能体运行列表：`tools/pre-execute` 记下七个角色的开始与真实 provider/model，
+ *      异步委派的收口靠 `subagent/end`（0.2.1 起工具调用一返回就成功），子会话
+ *      开始时 `subagent/start` 按专属 provider 名认领角色并装配人设/只读限制。列表
+ *      折叠成只读数据经自检路由给对话窗口的 dock 卡与右栏竖列（对话转录不注入任何进度行）。
  *      已完成行另从审计日志只读重建，因此 `dsh web` 重启后卡里仍有历史（running 行
  *      是内存态，重启即空 —— 符合设计）。
  *      每行另从子会话事件只读累加 settled 步的 outputTokens/decodeMs（口径与官方
  *      `sessionStats` 投影逐字段相同），供「速率」列使用；没有上报的行标未知。
  *      显示形态由客户端面板可配（`dockCardVisible` / `dockRows` / `dockFold` /
  *      `dockColumns` 四个字段，只影响客户端渲染哪几个面、显示多少行，宿主不据此做事）。
- *      同一份命名空间里还有 `roleColors`（角色 key → 8 色之一）：编辑页写它，列表色点、
+ *      同一份配置里还有 `roleColors`（角色 key → 8 色之一）：编辑页写它，列表色点、
  *      dock 行色条、右栏卡片色条三处读它。宿主只做白名单归一化（非法/缺项回落默认），
  *      色值与渲染全在客户端。
+ *
+ * 面板可写的字段声明的载体是**本文件导出的 `Config`**：0.2.0-rc.2 起「可编辑」＝
+ * schema 里标 `.volatile()`，面板直接读写本条目在 profile patch 里的 config
+ * （旧版那条「宿主向 settings 服务注册设置段」的 API 已从 DSH 删除，与下面客户端那批是
+ * 同一次清理）。配置变更经 `settings/document-updated` 事件通知，我们重读 volatile
+ * 引用并重建七个角色行。
+ *
+ * 客户端半侧的旧名记在这里（`lib/client.js` 的验收要求那个字符串出现 0 次，连注释也算，
+ * 所以名字只写在这边）：客户端服务 `settingsScope` 与它的 `bind({ namespace })`
+ * 被 `configForms.get(entryId)` 取代，客户端包 `@deepseek-ai/dsh-client-runtime` 已删除。
+ * 谁在 client.js 里重新写出这个名字，就等于让客户端条目永久 pending（桌面端拒绝启动）。
  *
  * 钩子走 DSH 的代码级事件，不依赖 `@deepseek-ai/dsh-hooks-claude-code` 适配器，
  * 也不复用 ZCode 的 PowerShell 脚本（任务书第三节设计决策 1）。
@@ -45,10 +58,48 @@ import { dirname, join, parse, resolve } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { ROLES, RULES_TEXT } from './generated-content.js'
 
+/**
+ * schemastery 版本守卫。
+ *
+ * `.volatile()` 是 0.2.0-rc.2 起**唯一**能让本插件的配置出现在设置页里的手段：
+ * `dsh-settings` 只为 volatile 字段派生表单，一个 volatile 字段都没有的条目会被
+ * `describe()` 整条跳过（另外抛 `no volatile fields`）。而 `.volatile()` 需要
+ * schemastery ≥ 3.18.2（本插件声明 ^3.18.4）。
+ *
+ * 为什么要单独守卫：node 会优先解析插件目录下的嵌套依赖，若那里残留一份旧的
+ * schemastery，它会遮蔽顶层正确的那份，报错却是 `z.boolean(...).volatile is not a function`
+ * —— 完全看不出真正原因（schemastery 自己那句 `volatile schema is already wrapped`
+ * 更误导：那是「同一个节点被标了两次 volatile」的意思，与版本无关）。
+ */
+function assertSchemasterySupportsVolatile(schemaLib) {
+  let ok = false
+  try {
+    ok = typeof schemaLib.boolean().default(false).volatile === 'function'
+  } catch {
+    ok = false
+  }
+  if (!ok) {
+    throw new Error(
+      'dsh-collab-mode: 解析到的 @deepseek-ai/schemastery 没有 `.volatile()`（需要 ≥3.18.2，本插件声明 ^3.18.4）。' +
+        '通常是插件目录下残留的嵌套旧副本遮蔽了顶层安装 —— 检查 ' +
+        '`dsh-collab-mode/node_modules/@deepseek-ai/schemastery`（常见是指向旧 3.18.x 的目录/链接），' +
+        '删掉它（或重装依赖）让顶层版本生效，然后完整重启 dsh web。',
+    )
+  }
+}
+assertSchemasterySupportsVolatile(z)
+
 export const name = 'collab-mode'
 export const inject = ['tools', 'systemPrompt']
 
-/** 设置命名空间：设置页卡片、面板读写、自检桥都用这一个键。 */
+/**
+ * 本插件的设置标识 —— 一个键三处用：`cordis.patch.yml` 里那一行的 **entry id**、
+ * 面板客户端 `ctx.configForms.get(entryId)` 的实参、自检桥 payload 里的 `namespace`。
+ *
+ * ⚠ 0.2.0-rc.2 起设置是「按 profile 条目」而不是「按命名空间」的：客户端 `get()` 与
+ * `whileServed()` 收的都是**条目 id**（`dsh-settings/lib/index.js:432` 的 `ns: entry.options.id`）。
+ * 本插件条目 id 恰好也叫 `collab-mode`，与它同值，但两者语义不同 —— 改名时要一起想。
+ */
 const NS = 'collab-mode'
 
 /**
@@ -119,47 +170,9 @@ function roleColorsFromPanel(panel) {
 }
 
 /**
- * 面板的全部可编辑项。A 区块 = routes（+ roleColors），B 区块 = 三个开关 + 阈值，
- * C 区块 = 运行卡显示形态（dockCardVisible / dockRows / dockFold / dockColumns）。
- */
-const PANEL_SCHEMA = z.object({
-  routes: z
-    .object(Object.fromEntries(ROLES.map((role) => [role.key, RoleRoute])))
-    .default({}),
-  gate: z.boolean().default(true),
-  audit: z.boolean().default(true),
-  warnOnTurnEnd: z.boolean().default(true),
-  declarationThreshold: z.number().default(3),
-  logDir: z.string().default(''),
-  /**
-   * 对话窗口那张运行卡（`conversation.input.dock`）的总开关（面板 C 区块，客户端读写）：
-   * false = 整卡不渲染。右栏竖列不受它影响（那里另有自己的 tab 开关）。
-   */
-  dockCardVisible: z.boolean().default(true),
-  /** 运行面显示的行数上限（0 = 不限）。 */
-  dockRows: z.number().default(8),
-  /** 折叠时最多显示多少条「已完成」行（进行中一律全显示）。 */
-  dockFold: z.number().default(3),
-  /** 显示哪些列（客户端按 DOCK_COLUMNS 勾选写入；至少一列由客户端校验）。 */
-  dockColumns: z
-    .object(Object.fromEntries(DOCK_COLUMNS.map((col) => [col.id, z.boolean().default(col.default)])))
-    .default({}),
-  /**
-   * 每个角色的标记色（角色 key → 色名）。编辑页点选后写这里，三处显示面
-   * （设置列表色点 / 对话 dock 行色条 / 右栏卡片色条）都读同一个值。
-   *
-   * 值类型用 `z.any()` 而不是 `z.string()`：非法色名要在**读的时候**回落默认色，
-   * 而不是让 schema 解析抛错 —— 解析失败会连累整个命名空间（注册直接抛错、
-   * 外部改文件时整段值退回上一次的好值）。白名单过滤在 `roleColorsFromPanel` 里。
-   */
-  roleColors: z
-    .object(Object.fromEntries(ROLES.map((role) => [role.key, z.any().default(DEFAULT_ROLE_COLORS[role.key])])))
-    .default({}),
-})
-
-/**
- * 面板里的列勾选 → 生效值：只认 DOCK_COLUMNS 里的键，缺项或非布尔一律回落到补丁层默认，
- * 免得客户端写进一个半截对象就把某列永久关掉。
+ * 列勾选白名单 → 生效值：只留 DOCK_COLUMNS 里的键，缺项或非布尔一律回落到给的默认值。
+ * 由 `resolveConfig` 调用 —— 读侧最后一道归一化，免得客户端写进一个半截对象（或几个
+ * schema 没声明、却塞进来的键）就把某列永久关掉、或让多余键漏进自检 payload。
  */
 function columnsFromPanel(panel, fallback) {
   const out = {}
@@ -176,14 +189,19 @@ const roleEntryId = (key) => `collab-${key}`
 /** 七个角色工具名 —— 「工具调用 → 角色」的唯一映射（审计重建也用同一个集合）。 */
 const ROLE_TOOLS = new Set(ROLES.map((role) => role.tool))
 
-/** 角色行的完整 config：loader 改写时要以它为底，避免丢字段。 */
+/**
+ * 角色行的完整 config：loader 改写时要以它为底，避免丢字段。
+ *
+ * DSH 0.2.1 起 `dsh-tool-subagent` 删除了 `persona` / `toolFilter`（带这两个
+ * 字段的行会在 apply 时直接抛错，七个角色工具因此全部消失），委派也改成异步
+ * activation，`backgroundMode` 一并失效。人设改由子会话作用域覆盖同名提示段、
+ * 只读限制改由子会话作用域 `tools.restrict()`，见 `applyRoleScope`。
+ */
 function roleRowConfig(role, route) {
   const config = {
-    provider: 'spawn',
+    provider: roleProviderName(role.key),
     toolName: role.tool,
-    backgroundMode: 'one-shot',
     maxDepth: 1,
-    persona: role.persona,
   }
   if (route !== undefined) {
     const agentOptions = {}
@@ -195,9 +213,35 @@ function roleRowConfig(role, route) {
     // dsh-tool-subagent 当成「已配置」去断言 provider 能力，而留空应当是继承。
     if (Object.keys(agentOptions).length > 0) config.agentOptions = agentOptions
   }
-  if (role.deny !== null) config.toolFilter = { deny: [...role.deny] }
   return config
 }
+
+/** 角色 key → 角色。子会话装配按 key 查（provider 映射出来的也是 key）。 */
+const ROLE_BY_KEY = new Map(ROLES.map((role) => [role.key, role]))
+
+/**
+ * 每个角色一个**独立的 spawn provider 名**。
+ *
+ * 0.2.1 的 `subagent/start` 只带 `{ provider, id }`，没有角色名或 tool 名；
+ * 角色工具又声明了 `isConcurrencySafe: () => true`（同一条消息里的多个委派会并发
+ * 创建子会话），按调用顺序认领会把 persona/只读限制装错会话。让每个角色行挂一个
+ * 专属 provider 名，就把「provider → 角色」变成可靠映射，并发下也不会串。
+ */
+const ROLE_PROVIDER_PREFIX = 'collab-spawn-'
+const roleProviderName = (key) => `${ROLE_PROVIDER_PREFIX}${key}`
+/** provider 名 → 角色。 */
+const ROLE_BY_PROVIDER = new Map(ROLES.map((role) => [roleProviderName(role.key), role.key]))
+/** spawn provider 的模块名（与 base 层同一实现，只是换个注册名）。 */
+const SPAWN_PROVIDER = '@deepseek-ai/dsh-subagent-spawn-in-process'
+
+/**
+ * 部署 persona 前缀的段名（`dsh-system-prompt` 的固定常量）。
+ * 在子会话作用域里注册同名段即可替换该子会话的 persona —— 与官方
+ * `dsh-persona` 行的替换机制相同，只是作用域落在单个子会话上。
+ */
+const PERSONA_SECTION = 'deployment:persona-prefix'
+/** `SECTION_ORDERS.DEPLOYMENT_PERSONA_PREFIX`。 */
+const PERSONA_SECTION_ORDER = 0
 
 /** 简报文件名：与本仓库规则文本、ZCode 侧 `enforce-flow.ps1` 保持一致。 */
 const BRIEF_MAIN = 'current-task.md'
@@ -237,15 +281,128 @@ const DEFAULTS = {
   roleColors: { ...DEFAULT_ROLE_COLORS },
 }
 
+/**
+ * 插件 Config —— Cordis 用它校验 patch 行里的 `config`，设置页也**只**按它派生可编辑表单。
+ *
+ * 面板可写的字段（A 区块 routes + roleColors、B 区块三个开关与阈值、C 区块四个显示字段）
+ * 全部标 `.volatile()`：0.2.0-rc.2 起「可编辑」的定义就是「schema 里标了 volatile」——
+ * `dsh-settings` 的 `volatileForm()` 只为 volatile 字段建表单，`describe()` 还会整条跳过
+ * 一个 volatile 字段都没有的条目。漏标一个字段的后果不是「那个字段灰掉」，而是
+ * **整个面板报「找不到命名空间」**。
+ *
+ * volatile 的三条硬约束（每条都在上游源码里有对应实现，踩了就是启动期抛错）：
+ *   1. **外层不能再套 volatile**：`dsh-app-boot` 的 `validateVolatilePlacement` 与
+ *      schemastery 自己的 `validateVolatileSchema` 都会抛
+ *      `volatile fields require a fixed object path without an enclosing volatile field`。
+ *      所以 `routes` / `dockColumns` / `roleColors` 这三个 map 是**整体**标一个 volatile，
+ *      它们的子字段保持普通 schema —— 子字段自动落在 volatile 路径下，一样可编辑。
+ *   2. **读法**：apply 收到的是引用，必须 `config.<字段>.get()` 取值（见本文件 resolveConfig）。
+ *   3. **校验由 schema 表达**，不再手写验证回调：`declarationThreshold` 正整数、
+ *      `dockRows` 0..DOCK_ROWS_MAX、`dockFold` 0..DOCK_FOLD_MAX。原来那三条抛错文案
+ *      改成 description，面板上的输入框直接带着范围与解释。
+ *
+ * `rulesSection` / `rulesOrder` 不标 volatile：改它们要重启（系统提示段的名字与排序位），
+ * 不属于「面板可写」的语义，留在 patch 里手工配。
+ */
+export const Config = z.object({
+  /** A 区块：七个角色的路由。整体一个 volatile —— 子字段可编辑，但不能各自再标。 */
+  routes: z
+    .object(Object.fromEntries(ROLES.map((role) => [role.key, RoleRoute])))
+    .default({})
+    .volatile(),
+  /** B 区块：改动前拦截总开关。 */
+  gate: z.boolean().default(DEFAULTS.gate).volatile().description('改动前拦截总开关'),
+  /** B 区块：工具调用审计总开关（只影响是否追加 JSON 日志行）。 */
+  audit: z.boolean().default(DEFAULTS.audit).volatile().description('工具调用审计总开关'),
+  /** B 区块：轮次结束告警总开关。 */
+  warnOnTurnEnd: z.boolean().default(DEFAULTS.warnOnTurnEnd).volatile().description('轮次结束告警总开关'),
+  /** B 区块：未声明的生产文件累计到几个就拦截／告警。 */
+  declarationThreshold: z
+    .number()
+    .step(1)
+    .min(1)
+    .default(DEFAULTS.declarationThreshold)
+    .volatile()
+    .description('未声明的生产文件累计到几个就拦截／告警（正整数）'),
+  /** 审计日志目录；留空 = `$DSH_HOME/hooks`（空串会被当作「没设」，见 resolveConfig）。 */
+  logDir: z.string().default('').volatile().description('审计日志目录；留空 = $DSH_HOME/hooks'),
+  /**
+   * C 区块：对话窗口那张运行卡（`conversation.input.dock`）的总开关。
+   * false = 整卡不渲染；右栏竖列不受它影响（那里另有自己的 tab 开关）。
+   */
+  dockCardVisible: z.boolean().default(DEFAULTS.dockCardVisible).volatile().description('对话窗口运行卡总开关'),
+  /** C 区块：运行面显示的行数上限（0 = 不限）。 */
+  dockRows: z
+    .number()
+    .step(1)
+    .min(0)
+    .max(DOCK_ROWS_MAX)
+    .default(DEFAULTS.dockRows)
+    .volatile()
+    .description(`运行面最多显示几行（0 = 不限，上限 ${DOCK_ROWS_MAX}）`),
+  /** C 区块：折叠时最多显示多少条「已完成」行（进行中一律全显示）。 */
+  dockFold: z
+    .number()
+    .step(1)
+    .min(0)
+    .max(DOCK_FOLD_MAX)
+    .default(DEFAULTS.dockFold)
+    .volatile()
+    .description(`折叠时最多显示几条已完成行（上限 ${DOCK_FOLD_MAX}）`),
+  /** C 区块：显示哪几列（客户端按 DOCK_COLUMNS 勾选写入；至少一列由客户端校验）。 */
+  dockColumns: z
+    .object(Object.fromEntries(DOCK_COLUMNS.map((col) => [col.id, z.boolean().default(col.default)])))
+    .default({})
+    .volatile(),
+  /**
+   * 每个角色的标记色（角色 key → 色名）。编辑页点选后写这里，三处显示面
+   * （设置列表色点 / 对话 dock 行色条 / 右栏卡片色条）都读同一个值。
+   *
+   * 值类型用 `z.any()` 而不是 `z.string()`：非法色名要在**读的时候**回落默认色，
+   * 而不是让 schema 解析抛错 —— 解析失败会让整个条目的配置读写一起红掉。
+   * 白名单过滤在 `roleColorsFromPanel` 里。
+   */
+  roleColors: z
+    .object(Object.fromEntries(ROLES.map((role) => [role.key, z.any().default(DEFAULT_ROLE_COLORS[role.key])])))
+    .default({})
+    .volatile(),
+  /** 系统提示段的名字（同层重名会抛错）。不是面板项：改它要重启。 */
+  rulesSection: z.string().default(DEFAULTS.rulesSection),
+  /** 系统提示段的排序位：400 = 在 persona prefix(0) 之后、PLAN_POLICY(500) 之前。 */
+  rulesOrder: z.number().default(DEFAULTS.rulesOrder),
+})
+
 /* ────────────────────────── 配置 ────────────────────────── */
 
-/** 校验并冻结配置。配置不合法直接抛错，不回退默认值 —— 静默降级比启动失败更难查。 */
+/**
+ * 生效配置：把 apply 收到的 Config 解包成普通对象，并补齐读侧默认值。
+ *
+ * ⚠ 每次读都要重新调用，**不能缓存结果**。`.volatile()` 字段在 apply 收到的 config 上是
+ * 一个**稳定引用**（loader 在 profile patch 被改写时就地更新它的值，引用本身不变），
+ * `get()` 永远给出最新值 —— 「面板保存后角色行立刻跟着变」靠的就是这条，
+ * 而不是靠重启 fiber（volatile-only 改动不重启，见 cordis-plugin-loader 的 `_commitVolatile`）。
+ *
+ * 为什么还有一层归一化：Config 已经给出默认值与类型校验，但
+ *   ① 离线夹具与降级路径会直接 `apply(ctx, {...})` 传半截对象；
+ *   ② `dockColumns` 要按 DOCK_COLUMNS 补缺项（半截对象不能把某列永久关掉）；
+ *   ③ `roleColors` 的非法色名要回落默认色（schema 故意不校验它）。
+ * 校验语义与 Config 保持一致；两边的默认值都来自 DEFAULTS 这一份，不各写一个数字。
+ * 不合法直接抛错，不回退默认值 —— 静默降级比启动失败更难查。
+ */
 function resolveConfig(raw) {
   if (raw === undefined || raw === null) return { ...DEFAULTS }
   if (typeof raw !== 'object' || Array.isArray(raw)) {
     throw new Error('collab-mode: config must be a mapping')
   }
-  const cfg = { ...DEFAULTS, ...raw }
+  // 先解包 volatile 引用，再谈默认值与校验 —— 否则拿到的是引用对象本身。
+  const plain = {}
+  for (const [key, value] of Object.entries(raw)) {
+    plain[key] = value !== null && typeof value === 'object' && typeof value.get === 'function' ? value.get() : value
+  }
+  const cfg = { ...DEFAULTS, ...plain }
+  // Config 里 `logDir` 的默认值是空串（schema 不能表达 undefined），这里还原成「没设」：
+  // 下游用 `logDir ?? $DSH_HOME/hooks` 判是否回默认目录，空串会让它落进空路径。
+  if (cfg.logDir === '') cfg.logDir = undefined
   for (const key of ['gate', 'audit', 'warnOnTurnEnd']) {
     if (typeof cfg[key] !== 'boolean') throw new Error(`collab-mode: \`${key}\` must be a boolean`)
   }
@@ -275,10 +432,17 @@ function resolveConfig(raw) {
   }
   for (const col of DOCK_COLUMNS) {
     const value = cfg.dockColumns[col.id]
-    // 缺项补 default；显式给了就必须是布尔 —— 静默改写用户配错的类型比启动失败更难查。
-    if (value === undefined) cfg.dockColumns[col.id] = col.default
-    else if (typeof value !== 'boolean') throw new Error(`collab-mode: \`dockColumns.${col.id}\` must be a boolean`)
+    // 缺项交给下面那行 `columnsFromPanel` 补默认（它同时做白名单裁剪），**不要就地写回**：
+    // `cfg.dockColumns` 来自 `Volatile.get()`，是深冻结快照，就地写会在严格模式抛 TypeError；
+    // 那个异常从 `resolveConfig` 冒到 apply 里唯一没 try/catch 的调用点，会让整个条目加载失败。
+    // 显式给了就必须是布尔 —— 静默改写用户配错的类型比启动失败更难查。
+    if (value !== undefined && typeof value !== 'boolean') {
+      throw new Error(`collab-mode: \`dockColumns.${col.id}\` must be a boolean`)
+    }
   }
+  // 再过一道白名单：只留 DOCK_COLUMNS 里的键。schema 的 object 不会拒收多余键，
+  // 放它们过去的话，自检 payload 与客户端渲染都会看到一份「多出来几列」的映射（见 columnsFromPanel）。
+  cfg.dockColumns = columnsFromPanel(cfg.dockColumns, DEFAULTS.dockColumns)
   if (cfg.roleColors === null || typeof cfg.roleColors !== 'object' || Array.isArray(cfg.roleColors)) {
     throw new Error('collab-mode: `roleColors` must be a mapping of role key → color name')
   }
@@ -464,7 +628,7 @@ function pluginMessage(text) {
     id: randomUUID(),
     role: 'user',
     content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: 'collab-mode' },
+    source: { kind: 'plugin:collab-mode' },
   })
 }
 
@@ -770,37 +934,29 @@ function cachedRemoteVersion() {
 
 /**
  * @param ctx - 拥有这些注册的上下文（本插件挂在 Host 平面）。
- * @param rawConfig - bundle patch 里那一行的 `config`。
+ * @param config - 本条目在 profile patch 里的 `config`，已按上面那份 `Config` 解析。
+ *   `.volatile()` 字段到这里是**引用**（读法 `config.<字段>.get()`），不是普通值。
  */
-export function apply(ctx, rawConfig) {
-  // patch 行里的 config 是**默认值**；设置面板的命名空间值覆盖它（任务书第三节 B 区块）。
-  const patchCfg = resolveConfig(rawConfig)
+export function apply(ctx, config) {
+  /**
+   * 生效配置。0.2.0-rc.2 起「patch 行里的 config」与「面板写的值」是**同一份**：
+   * 面板保存走 `settings.mutate(NS, ops)` → configEditor 改写的就是本条目 config，
+   * 不再有第二层命名空间（旧版那条宿主设置注册 API 提供的 base/用户层语义，
+   * 现在由 Cordis 的组合层 patch 机制接管）。所以读数只有这一条路径，
+   * 且每次都要重新解包 volatile 引用。
+   */
+  const current = () => resolveConfig(config)
+  /** 启动那一刻的生效值：只给「不随面板变」的字段用（rulesSection / rulesOrder 要重启才生效）。 */
+  const patchCfg = current()
   const homeNorm = normalizePath(dshHome())
   const startedAt = new Map()
 
-  /** 生效值：初始等于 patch 默认值，settings 一旦挂上就由它驱动。 */
+  /** 生效值：随面板变（`syncFromConfig()` 就地更新，三个钩子每次读它）。 */
   let live = { ...patchCfg }
   let logDir = patchCfg.logDir ?? join(dshHome(), 'hooks')
   let auditDirReady = false
-  /** 设置面板当前值（未挂 settings 时用组合层默认值）。 */
-  let settingsSource = () => null
 
-  /* ---- 设置命名空间 ---- */
-
-  /** 组合层 `base`：面板里点「重置」回到这组值。 */
-  const baseEntry = {
-    routes: {},
-    gate: patchCfg.gate,
-    audit: patchCfg.audit,
-    warnOnTurnEnd: patchCfg.warnOnTurnEnd,
-    declarationThreshold: patchCfg.declarationThreshold,
-    logDir: patchCfg.logDir ?? '',
-    dockCardVisible: DEFAULTS.dockCardVisible,
-    dockRows: DEFAULTS.dockRows,
-    dockFold: DEFAULTS.dockFold,
-    dockColumns: { ...DEFAULTS.dockColumns },
-    roleColors: { ...DEFAULTS.roleColors },
-  }
+  /* ---- 设置 ---- */
 
   /** 角色行的 loader entry id。与 v0.1.0 的补丁行 id 同名，便于识别。 */
   const TOOL_SUBAGENT = '@deepseek-ai/dsh-tool-subagent'
@@ -824,12 +980,46 @@ export function apply(ctx, rawConfig) {
    * bundle / profile / home 三层补丁。插件自己 create 的行挂在 Loader 自己的 root
    * group 上，而 `Loader.write()` 是空实现，因此 `loader.update` 只热重启那一行。
    */
+  /**
+   * 每个角色一个独立 spawn provider 行（provider 名即角色标识，见 ROLE_PROVIDER_PREFIX）。
+   * 角色行必须在 provider 行之后创建：`dsh-tool-subagent` 按 provider 名字镜像工具注册。
+   */
+  async function syncProviderRows(loader) {
+    const failures = []
+    for (const role of ROLES) {
+      const id = `collab-provider-${role.key}`
+      const config = { providerName: roleProviderName(role.key) }
+      try {
+        const entry = resolveEntry(loader, id)
+        if (entry === undefined) {
+          await loader.create({ id, name: SPAWN_PROVIDER, config })
+        } else if (JSON.stringify(entry.options.config ?? null) !== JSON.stringify(config)) {
+          await loader.update(id, { config })
+        }
+      } catch (error) {
+        failures.push({ id, message: String(error && error.message) })
+      }
+    }
+    // 同一个原因（最常见：spawn 包没装）会让 7 行各报一次同样的错，刷屏且盖住真正信息。
+    // 全同则合并成一条并带上角色数；只要有一条不同，就照旧逐行打印，不丢差异。
+    if (failures.length > 1 && failures.every((item) => item.message === failures[0].message)) {
+      ctx.logger?.warn(
+        `collab-mode: ${failures.length} 条 provider 行全部失败（同一原因）: ${failures[0].message}`,
+      )
+    } else {
+      for (const item of failures) {
+        ctx.logger?.warn(`collab-mode: provider row "${item.id}" failed to apply: ${item.message}`)
+      }
+    }
+  }
+
   async function syncRoleRows(routes) {
     const loader = ctx.get('loader')
     if (loader === undefined) {
       ctx.logger?.warn('collab-mode: loader service unavailable — role rows were not registered')
       return
     }
+    await syncProviderRows(loader)
     for (const role of ROLES) {
       const id = roleEntryId(role.key)
       const config = roleRowConfig(role, routes === null || routes === undefined ? undefined : routes[role.key])
@@ -846,40 +1036,28 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  /** 把面板值落进生效值，并把角色行同步过去。 */
-  function syncFromSettings() {
+  /**
+   * 重读生效配置，把面板值落进 `live` 并把七个角色行同步过去。
+   *
+   * 两个触发点：① apply 时先跑一次（**没有 settings 也要有七个角色工具**，
+   * v0.1.0 行为不变）；② `settings/document-updated` —— 面板保存、外部改
+   * profile patch、以及 `describe()` 发现条目 raw 变了都会发这个事件，
+   * 载荷是 `(ns, revision)`，`ns` 就是条目 id。
+   *
+   * 为什么读的是 `current()` 而不是事件里的值：事件只告诉你「变了」，
+   * volatile 引用本身已经被 loader 就地更新（`_commitVolatile`），`get()` 就是最新值。
+   */
+  function syncFromConfig() {
     let panel
     try {
-      panel = settingsSource()
+      panel = current()
     } catch (error) {
-      ctx.logger?.warn(`collab-mode: settings source failed: ${String(error && error.message)}`)
-      panel = null
+      // 读失败保持上一次的好值并说出来 —— 静默用半截配置比报错更难查。
+      ctx.logger?.warn(`collab-mode: config read failed: ${String(error && error.message)}`)
+      return
     }
-    if (panel === null || typeof panel !== 'object') return
-    live = {
-      ...patchCfg,
-      gate: typeof panel.gate === 'boolean' ? panel.gate : patchCfg.gate,
-      audit: typeof panel.audit === 'boolean' ? panel.audit : patchCfg.audit,
-      warnOnTurnEnd: typeof panel.warnOnTurnEnd === 'boolean' ? panel.warnOnTurnEnd : patchCfg.warnOnTurnEnd,
-      declarationThreshold:
-        Number.isInteger(panel.declarationThreshold) && panel.declarationThreshold >= 1
-          ? panel.declarationThreshold
-          : patchCfg.declarationThreshold,
-      dockCardVisible:
-        typeof panel.dockCardVisible === 'boolean' ? panel.dockCardVisible : patchCfg.dockCardVisible,
-      dockRows:
-        Number.isInteger(panel.dockRows) && panel.dockRows >= 0 && panel.dockRows <= DOCK_ROWS_MAX
-          ? panel.dockRows
-          : patchCfg.dockRows,
-      dockFold:
-        Number.isInteger(panel.dockFold) && panel.dockFold >= 0 && panel.dockFold <= DOCK_FOLD_MAX
-          ? panel.dockFold
-          : patchCfg.dockFold,
-      dockColumns: columnsFromPanel(panel.dockColumns, patchCfg.dockColumns),
-      roleColors: roleColorsFromPanel(panel.roleColors),
-    }
-    const nextLogDir =
-      typeof panel.logDir === 'string' && panel.logDir !== '' ? panel.logDir : patchCfg.logDir ?? join(dshHome(), 'hooks')
+    live = { ...panel }
+    const nextLogDir = panel.logDir ?? join(dshHome(), 'hooks')
     if (nextLogDir !== logDir) {
       logDir = nextLogDir
       auditDirReady = false
@@ -888,30 +1066,22 @@ export function apply(ctx, rawConfig) {
   }
 
   ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.installSection(ctx, NS, PANEL_SCHEMA, baseEntry, {
-      setSource: (current) => {
-        settingsSource = current
-        syncFromSettings()
-      },
-      onChange: () => {
-        syncFromSettings()
-      },
-      validate: (value) => {
-        if (!Number.isInteger(value.declarationThreshold) || value.declarationThreshold < 1) {
-          throw new Error('collab-mode: declarationThreshold must be a positive integer')
-        }
-        if (!Number.isInteger(value.dockRows) || value.dockRows < 0 || value.dockRows > DOCK_ROWS_MAX) {
-          throw new Error('collab-mode: dockRows must be an integer between 0 and ' + DOCK_ROWS_MAX)
-        }
-        if (!Number.isInteger(value.dockFold) || value.dockFold < 0 || value.dockFold > DOCK_FOLD_MAX) {
-          throw new Error('collab-mode: dockFold must be an integer between 0 and ' + DOCK_FOLD_MAX)
-        }
-      },
-    })
+    // 自带面板页 → 关掉「按 schema 自动生成表单」那条路（面板由本插件客户端渲染）。
+    // 策略挂在**本插件 fiber** 上：Settings 服务迟到或被替换时会重新采纳这条策略；
+    // settings 缺席时整个子级不跑，插件照常工作（角色行已由上面那次 syncFromConfig 建好）。
+    settingsCtx.effect(() => settingsCtx.settings.configure({ auto: false }, ctx.fiber))
+    // 配置变更 → 重读 volatile 值 → 重建角色行 / 刷新 dock 与审计状态。
+    // 注意 `settings/document-updated` 是全应用广播的事件（Cordis 事件不按子级隔离），
+    // 所以必须自己按 ns 过滤，否则别的插件改一次配置我们就把七行重写一遍。
+    settingsCtx.effect(() =>
+      settingsCtx.on('settings/document-updated', (ns) => {
+        if (String(ns) !== NS) return
+        syncFromConfig()
+      }),
+    )
   })
 
-  // 没有 settings 也要有七个角色工具（v0.1.0 行为不变）：先用组合层默认值建行。
-  void syncRoleRows(baseEntry.routes)
+  void syncFromConfig()
 
   ctx.logger?.info(
     `collab-mode: active — gate=${live.gate} audit=${live.audit} warnOnTurnEnd=${live.warnOnTurnEnd} ` +
@@ -944,25 +1114,24 @@ export function apply(ctx, rawConfig) {
 
   /* ---- 2b. 子智能体运行可视化（只读状态，对话转录一行都不注入） ----
    *
-   * 起止直接借已有的两个工具钩子（`tools/pre-execute` / `tools/post-execute`）：
-   * 角色工具调用进来时记一行「开始」，出去时把同一 callId 翻成结束。列表按
-   * 开始时间折叠，经自检路由（已过认证栅栏）暴露给对话窗口的 dock 卡。
+   * 0.2.1 的委派是异步 activation：`tools/pre-execute` 记一行「开始」，
+   * `tools/post-execute` 只代表「已启动」（工具内容就是 `started subagent <id>`），
+   * 真正的结束由 `subagent/end` 收口。列表按开始时间折叠，经自检路由
+   * （已过认证栅栏）暴露给对话窗口的 dock 卡。
    *
-   * 为什么不用 `subagent/start|end`：那两个事件按委派方作用域派发，身上只有
-   * `provider`（子智能体 provider 名，如 `spawn`）和子会话 id，**没有角色名**——
-   * 圆桌三席并发时无法把某个 run 认领给 advisor-A/B/C。工具调用天然带 `exec.name`
-   * 和逐次唯一的 `callId`，是唯一不歧义的键。
+   * 角色名怎么来：每个角色行挂一个独立的 spawn provider（`collab-spawn-<key>`），
+   * `subagent/start` 的 `info.provider` 就是角色标识 —— 角色工具并发创建子会话时
+   * 也不会串（它们声明了 `isConcurrencySafe: () => true`，不能靠调用顺序认领）。
+   * 子会话作用域的人设/只读限制就在这个事件里装配（见 `noteSubagentStart`）。
    *
    * 「真实 provider/model」读请求头，不信子智能体自报：优先取角色行上的
    * `agentOptions`（面板配的显式路由），留空则读委派方会话的
    * `session.requestHeader().config` —— 与 `dsh-tool-subagent` 的
    * `parentAgentOptionsForDelegation` / `resolveChildAgentOptions` 同一套继承语义。
    *
-   * ⚠ 「没等到 post-execute」**不等于**卡死：前台委派（run_in_background 缺省关闭）
-   * 的 post-execute 要等子智能体整轮跑完才来，实测有一次 executor 的 latency 是
-   * 1970576ms（33 分钟）。只按 startedAt 超时判 stale，会把正在干活的 33 分钟全标成
-   * 「无响应」。所以存活时间 `aliveAt` 由**子会话自己的活动**刷新，且**只刷新它自己
-   * 那一行**（按 `session.header.id` 精确到行，未认领的行才按委派方会话粗刷）：
+   * ⚠ 「没有活动」**不等于**卡死：只按 startedAt 超时判 stale，会把正在干活的长任务
+   * 全标成「无响应」。所以存活时间 `aliveAt` 由**子会话自己的活动**刷新，且**只刷新它
+   * 自己那一行**（按 `session.header.id` 精确到行，未认领的行才按委派方会话粗刷）：
    *   - 子智能体每次工具调用（同一个 pre-execute 钩子，agent 是子会话）；
    *   - 子会话的工具跑完（post-execute，同一钩子）—— 静默长命令结束后立刻回正；
    *   - 子会话每帧流式输出（`agent/assistant-stream`，payload 带 agent）。
@@ -1043,10 +1212,11 @@ export function apply(ctx, rawConfig) {
     }
     const startedAt = Date.now()
     const route = effectiveRoute(exec.agent, exec.name)
+    const sid = sessionIdOf(exec.agent) ?? 'unknown'
     runs.set(exec.callId, {
       callId: exec.callId,
       role: exec.name,
-      sid: sessionIdOf(exec.agent) ?? 'unknown',
+      sid,
       provider: route.provider,
       model: route.model,
       reasoningEffort: route.reasoningEffort,
@@ -1155,14 +1325,153 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  /** post-execute：同一 callId 翻成结束。钩子被吞（拒绝/被杀）时这行不执行 → 行留在 running。 */
+  /**
+   * post-execute：0.2.1 的角色工具一返回就成功（内容只是 `started subagent <id>`），
+   * 真正的结束由 `subagent/end` 收口。只有启动失败（isError）才在这里立即结束。
+   */
   function noteRunEnd(exec, result) {
     const record = runs.get(exec.callId)
     if (record === undefined) return
-    record.endedAt = Date.now()
-    record.ok = result?.isError !== true
-    record.ms = record.endedAt - record.startedAt
+    if (result?.isError === true) {
+      record.endedAt = Date.now()
+      record.ok = false
+      record.ms = record.endedAt - record.startedAt
+    }
   }
+
+  /**
+   * 一个新子会话认领它的角色，并在**子会话自己的作用域**里装上人设与只读限制。
+   *
+   * 为什么不是行配置：0.2.1 删了 `dsh-tool-subagent.persona/toolFilter`，官方路径
+   * 是 Agent Preset；但角色子会话需要继承部署侧工具面（父会话预设），新建 preset
+   * 会换成另一套工具，故改用作用域覆盖：
+   *   - 同名的 `deployment:persona-prefix` 段 → 替换该子会话的 persona；
+   *   - `tools.restrict({deny})` → 从该子会话的可见工具面摘掉写操作（未知名字会抛，
+   *     先按可见性过滤；restrict 仍失败则退化为执行期 guard，绝不静默放开）。
+   * 注册挂在子会话的 disposer 上，子会话结束即释放。
+   */
+  function applyRoleScope(agent, roleKey) {
+    const role = ROLE_BY_KEY.get(roleKey)
+    const childCtx = agent?.ctx
+    if (role === undefined || childCtx === undefined || childCtx === null) {
+      if (role === undefined) ctx.logger?.warn(`collab-mode: 未知角色 key "${roleKey}"，跳过子会话作用域装配`)
+      return
+    }
+    const register = () => {
+      const disposers = []
+      try {
+        const prompt = childCtx.systemPrompt ?? (typeof childCtx.get === 'function' ? childCtx.get('systemPrompt') : undefined)
+        if (prompt !== undefined && prompt !== null && typeof prompt.section === 'function') {
+          disposers.push(
+            prompt.section({ name: PERSONA_SECTION, order: PERSONA_SECTION_ORDER, text: role.persona }),
+          )
+        }
+      } catch (error) {
+        ctx.logger?.warn(`collab-mode: persona 覆盖失败（${roleKey}）：${String(error && error.message)}`)
+      }
+      try {
+        if (Array.isArray(role.deny) && role.deny.length > 0) {
+          const tools = childCtx.tools ?? (typeof childCtx.get === 'function' ? childCtx.get('tools') : undefined)
+          if (tools !== undefined && tools !== null && typeof tools.restrict === 'function') {
+            const visible = role.deny.filter((name) => {
+              try {
+                // ⚠ scope 不能省：省略 = global view，而标准预设的工具注册在
+                // preset generation scope，会全部被误判成「不可见」。
+                return tools.get(name, agent) !== undefined
+              } catch {
+                return false
+              }
+            })
+            let restricted = false
+            if (visible.length > 0) {
+              try {
+                disposers.push(tools.restrict({ deny: visible }))
+                restricted = true
+              } catch (error) {
+                // 名单里有 scope-local / 未知名字时 restrict 会整单拒绝。
+                ctx.logger?.warn(`collab-mode: restrict 失败（${roleKey}）：${String(error && error.message)}`)
+              }
+            }
+            // 只要有缺口（有名字不可见，或 restrict 失败），就用执行期 guard 兜住
+            // **全名单**：宁可不在 schema 里藏，也不能让只读角色静默变成可写。
+            if ((!restricted || visible.length !== role.deny.length) && typeof tools.guard === 'function') {
+              const deny = new Set(role.deny)
+              disposers.push(
+                tools.guard((exec) => (deny.has(exec?.name) ? `collab-mode: ${roleKey} 是只读角色，禁止调用 ${exec.name}` : undefined)),
+              )
+            }
+          } else if (tools !== undefined && tools !== null && typeof tools.guard === 'function') {
+            const deny = new Set(role.deny)
+            disposers.push(
+              tools.guard((exec) => (deny.has(exec?.name) ? `collab-mode: ${roleKey} 是只读角色，禁止调用 ${exec.name}` : undefined)),
+            )
+          } else {
+            // 连 guard 都装不上：这是 fail-open，必须留下可检索的告警。
+            ctx.logger?.warn(`collab-mode: 无法为只读角色 ${roleKey} 安装任何只读限制（tools 服务不可用）`)
+          }
+        }
+      } catch (error) {
+        ctx.logger?.warn(`collab-mode: 只读限制安装失败（${roleKey}）：${String(error && error.message)}`)
+      }
+      return () => {
+        for (const dispose of disposers) {
+          try {
+            dispose()
+          } catch {
+            /* 子会话已销毁时 disposer 可能已执行过 */
+          }
+        }
+      }
+    }
+    try {
+      if (typeof childCtx.effect === 'function') childCtx.effect(register)
+      else register()
+    } catch (error) {
+      ctx.logger?.warn(`collab-mode: 子会话装配失败（${roleKey}）：${String(error && error.message)}`)
+    }
+  }
+
+  /**
+   * `subagent/start`：每个角色行都挂在自己的 spawn provider 上（`collab-spawn-<key>`），
+   * 因此 `info.provider` 就是角色的可靠标识 —— 不再依赖「pre-execute 顺序 = 子会话
+   * 创建顺序」（0.2.1 的角色工具声明了 `isConcurrencySafe: () => true`，同一条消息里
+   * 并发委派时顺序不保证）。拿到子会话 Agent 后在该会话作用域里装人设/只读限制。
+   *
+   * 时序：`startActivation` 先 materialize（发 `subagent/start`）再提交首条 prompt，
+   * 所以这里早于该子会话的第一次提示组装；`resume` 也会重新发 start，追问时限制不会丢。
+   */
+  function noteSubagentStart(info) {
+    const provider = typeof info?.provider === 'string' ? info.provider : ''
+    const roleKey = ROLE_BY_PROVIDER.get(provider)
+    if (roleKey === undefined) return
+    const childSid = info?.id
+    if (typeof childSid !== 'string' || childSid === '') return
+    let agent
+    try {
+      agent = ctx.get('agents')?.get?.(childSid)
+    } catch {
+      agent = undefined
+    }
+    if (agent === undefined || agent === null) {
+      ctx.logger?.warn(`collab-mode: 子会话 ${childSid}（${roleKey}）在 subagent/start 时取不到 Agent，跳过作用域装配`)
+      return
+    }
+    applyRoleScope(agent, roleKey)
+  }
+
+  /** `subagent/end`：按子会话 id 收口对应的运行行（0.2.1 的委派是异步的）。 */
+  function noteSubagentEnd(info) {
+    const childSid = info?.id
+    if (typeof childSid !== 'string' || childSid === '') return
+    for (const record of runs.values()) {
+      if (record.childSid !== childSid || record.endedAt !== 0) continue
+      record.endedAt = Date.now()
+      record.ok = info?.stopReason === 'completed'
+      record.ms = record.endedAt - record.startedAt
+      return
+    }
+  }
+
 
   /* ---- 2c. 速率：子会话事件 → 各委派行的 settled 步累积（只读） ----
    *
@@ -1581,6 +1890,25 @@ export function apply(ctx, rawConfig) {
     touchChild(payload?.agent)
   })
 
+  /**
+   * 子会话开始：0.2.1 的委派是异步 activation，provider 名就是角色标识。
+   * 这里装配子会话作用域的人设/只读限制（见 `applyRoleScope`）。
+   * 运行行与子会话 id 的绑定仍交给 `claimRun`（按父会话 + prompt 头精确认领）。
+   */
+  ctx.on('subagent/start', (info) => {
+    // 生命周期边沿有 per-listener 异常隔离，但装配失败仍要留下可检索的告警。
+    try {
+      noteSubagentStart(info)
+    } catch (error) {
+      ctx.logger?.warn(`collab-mode: subagent/start 装配失败：${String(error && error.message)}`)
+    }
+  })
+
+  /** 子会话结束：异步委派的真正收口点（post-execute 只是「已启动」）。 */
+  ctx.on('subagent/end', (info) => {
+    noteSubagentEnd(info)
+  })
+
   /* ---- 3. 改动前拦截 ---- */
   ctx.on('tools/pre-execute', async (exec, next) => {
     startedAt.set(exec.callId, Date.now())
@@ -1846,7 +2174,8 @@ export function apply(ctx, rawConfig) {
       const agentOptions = config?.agentOptions
       // 面板列表/编辑页的只读展示字段（描述/色标/工具/人设全文均只读，不可编辑）。
       const meta = roleMeta(role.key)
-      const denyList = Array.isArray(config?.toolFilter?.deny) ? [...config.toolFilter.deny] : []
+      // 0.2.1 起行配置里没有人设/deny：展示值直接取插件内容源（与子会话装配同源）。
+      const denyList = Array.isArray(role.deny) ? [...role.deny] : []
       rows.push({
         key: role.key,
         tool: role.tool,
@@ -1863,8 +2192,8 @@ export function apply(ctx, rawConfig) {
         maxTokens: agentOptions?.maxTokens ?? 0,
         deniedTools: denyList.length,
         denied: denyList,
-        personaChars: typeof config?.persona === 'string' ? config.persona.length : 0,
-        persona: typeof config?.persona === 'string' ? config.persona : '',
+        personaChars: role.persona.length,
+        persona: role.persona,
         description: typeof meta?.description === 'string' ? meta.description : '',
         color: typeof meta?.color === 'string' ? meta.color : '',
         tools: Array.isArray(meta?.tools) ? [...meta.tools] : [],

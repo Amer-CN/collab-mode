@@ -165,7 +165,7 @@ DSH 生成物 `ROLES` / 面板 `ROLE_ROWS` / ZCode `agent-*.md` 各 7 个，少�
 
 | 文件 | 职责 | 注意 |
 |---|---|---|
-| `dsh-collab-mode/lib/index.js` | 宿主半侧：提示段、三个钩子、settings 命名空间、自检路由 | **不是生成物**，直接改 |
+| `dsh-collab-mode/lib/index.js` | 宿主半侧：提示段、三个钩子、配置 schema（`.volatile()` 字段 = 设置页可编辑项）、自检路由 | **不是生成物**，直接改 |
 | `dsh-collab-mode/lib/client.js` | 浏览器半侧：设置面板卡片 | **不是生成物**，直接改 |
 | `dsh-collab-mode/build.mjs` | 构建脚本 | 改它要同步改 `check-drift.mjs` 的断言 |
 | `lib/generated-content.js`、`cordis.patch.yml` | **生成物，禁止手改** | 手改会在下次构建被覆盖 |
@@ -272,10 +272,12 @@ DSH 侧相反：`link:` 安装者改完仓库、重启 `dsh web` 即生效，无
 | 模块代码不能热更新 | 改 `lib/` 必须重启 `dsh web` |
 | `tools/pre-execute` 不能改写参数 | DSH 有意为之。所以"面板改路由"必须走 `loader.update` 改角色行，不能拦截改写 |
 | `loader.update` 对补丁插入的行会回写合成树 | 会压平 bundle/profile/home 三层补丁。所以七个角色行由插件用 `ctx.loader.create()` 自己拥有（挂在 Loader root group，`write()` 是空实现） |
-| 客户端 `inject` 必须声明 `settingsScope` | 用 `ctx.get()` 一次性读取会在服务晚到时永久降级（v0.2.0 的真实缺陷） |
+| 客户端 `inject` 的每个名字必须是 0.2.0 的**服务键** | 查不到 ⇒ fiber 永久 `pending` ⇒ **桌面端判定致命、应用拒绝启动**，并触发「禁用第三方插件、备份 profile patch 并重启」恢复动作（会重置 profile 的 `dsh.profiles.bundles`）。旧服务 `settingsScope` 在 0.2.0 已删（现为 `configForms`）；包级 `dsh.client.inject` 只认**包名**且查不到是**静默跳过**——两套名字集混写都是静默失败 |
+| 设置面板 = 条目 Config 里的 `.volatile()` 字段 | 宿主 `settings.installSection` 在 0.2.0 已删。条目要出现在设置页必须同时满足三条：有 Config schema + fiber ACTIVE + **至少一个 volatile 字段**（`dsh-settings` 只给 volatile 字段派生表单，否则整条被 `describe()` 跳过）。改完必须活体验证：面板保存后值要落进 profile 的 `cordis.patch.yml` |
+| 客户端 `ctx.inject` 只对 boot 条目合法 | `dsh-cordis-client-runner` 给「agent 即席写的 dynamic 包」套了白名单 ctx 代理（`CTX_VERBS` 不含 `inject`，**读属性即抛**）；而 profile 里 `link:`/bundle 装的插件走 boot graph（entry 名无 `dyn/` 前缀，经 vendored Loader），拿到的是真 fiber ctx，`ctx.inject` 照常可用 |
 | 自检路由必须走认证栅栏 | `webServer.match()` 是 exact 优先，`/api/xxx` exact 路由会**绕过** `/api` prefix 上的认证。必须调 `connection.requestRejection(req)` |
 | `~/.zcode` 配置树在钩子里豁免 | 改协作系统自身的配置不被计数（v1.1.4 起）。代价：治理工具自身改动无机器门禁 |
-| 夹具与真实运行时有差异 | 离线夹具的 `inject` 是同步回调，掩盖了真实 Cordis 的异步依赖语义。**依赖注入时机的行为，夹具验不出来，必须活体验证** |
+| 夹具与真实运行时有差异 | 离线夹具的 `inject` 是同步回调，掩盖了真实 Cordis 的异步依赖语义。**依赖注入时机的行为，夹具验不出来，必须活体验证**。2026-10-07 复核又确认三处具体失真：① 夹具的 `volatileBox` 是**可变**对象，真实 `Volatile.get()` 是**深冻结**快照（所以「就地写 `.get()` 的返回」这类 bug 夹具测不到，且它在严格模式下会抛 TypeError 冒到 `resolveConfig` 的唯一无 try/catch 调用点、整个条目加载失败）；② 夹具的 `effect: (fn) => fn()` **从不 dispose、从不重跑**（真实 Cordis 会在依赖变化时重跑，所以「`configure` 被调两次 → Settings presentation already configured」这类路径测不到）；③ 夹具的 `whileServed` **无条件立即 register**（真实实现要等 describe 镜像里出现该条目）——**「宿主没服务条目 → 面板静默不出现」恰恰是 0.2.0 移植要修的那类故障，离线结构上测不到**，只能活体验收 |
 
 ---
 
