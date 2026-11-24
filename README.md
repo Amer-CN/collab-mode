@@ -1,3 +1,9 @@
+> [!WARNING]
+> **本项目已停止维护 / No longer maintained**
+> 2026-11-24 起归档。作者已放弃这套「协作模式」方案：模型与 Agent 能力提升后，
+> DSH 自带的 `subagent` / `agent-team` 已覆盖原来的角色分工；本插件与配套 Skill
+> 不再更新，也不再适配新版 DSH。代码与文档仅作历史参考，**不建议在新环境安装**。
+> Archived on 2026-11-24. Kept for historical reference only. No new issues or PRs.
 <p align="center"><img src="https://capsule-render.vercel.app/api?type=waving&color=0:1F4E79,100:0D2137&height=170&section=header&text=collab-mode&fontSize=64&fontColor=ffffff&animation=fadeIn" width="100%"></p>
 
 <div align="center">
